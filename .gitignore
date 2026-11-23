@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 打包产物（绿色版 exe 在 dist/，不进仓库）
+dist/
+build/lnpu/
+
+# 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 日志
+*.log
+
+# 自测截图
+build/st_*.png
+build/selftest_*.png
