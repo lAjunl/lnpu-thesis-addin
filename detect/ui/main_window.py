@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
+from PySide6.QtCore import QEvent, Qt, QTimer, QPointF, QRectF
 from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -208,6 +208,7 @@ class MainWindow(QMainWindow):
         self.cached_out: Path | None = None
         self.overrides: dict = {}     # 段索引 → 手动格式（预览里点段落改的）
         self._jump: dict = {}         # 每个预览区的「跳至指定页」控件
+        self.setAcceptDrops(True)    # 把 docx 拖进窗口直接打开
 
         self._build()
 
@@ -780,7 +781,14 @@ class MainWindow(QMainWindow):
         self.open_path(Path(path))
 
     def open_path(self, path: Path) -> bool:
-        """打开指定路径的 docx（按钮和命令行参数共用）。"""
+        """打开指定路径的 docx（按钮、命令行参数、拖拽共用）。"""
+        if path.suffix.lower() != ".docx":
+            QMessageBox.information(
+                self, "打不开这个文件",
+                "只支持 .docx（Word 2007 及以后的格式）。\n"
+                "如果是 .doc，请先在 Word 里「另存为」成 .docx 再打开。",
+            )
+            return False
         self.path = path
         try:
             from docx import Document
@@ -808,6 +816,58 @@ class MainWindow(QMainWindow):
             f"文献 {c.get('reference', 0)} ｜ 编号体系 {self.analysis.scheme}"
         )
         return True
+
+    # ---------------------------------------------------------------- #
+    # 拖拽：把 docx 拖进窗口（任意位置）直接打开
+    # ---------------------------------------------------------------- #
+    def _drop_docx(self, event) -> Path | None:
+        """拖拽里的第一个本地 .docx；不是就返回 None。"""
+        for u in event.mimeData().urls():
+            if not u.isLocalFile():
+                continue
+            p = Path(u.toLocalFile())
+            return p if p.suffix.lower() == ".docx" else None
+        return None
+
+    def _drop_hl(self, on: bool, name: str = "") -> None:
+        """拖拽悬停时的视觉反馈：内容区淡蓝 + 状态栏提示。"""
+        cw = self.centralWidget()
+        if cw is not None:
+            cw.setStyleSheet("background:#e8f1ff;" if on else "")
+        if on:
+            self.statusBar().showMessage(f"松开鼠标，打开 {name}")
+
+    def handle_drag_event(self, event) -> bool:
+        """处理拖拽事件（由 App.notify() 转发过来）。返回 True 表示已消费。"""
+        t = event.type()
+        if t == QEvent.Type.DragEnter:
+            p = self._drop_docx(event)
+            if p is None:
+                event.ignore()
+            else:
+                event.acceptProposedAction()
+                self._drop_hl(True, p.name)
+            return True
+        if t == QEvent.Type.DragMove:
+            p = self._drop_docx(event)
+            if p is None:
+                event.ignore()
+            else:
+                event.acceptProposedAction()
+            return True
+        if t == QEvent.Type.DragLeave:
+            self._drop_hl(False)
+            return True
+        if t == QEvent.Type.Drop:
+            p = self._drop_docx(event)
+            if p is None:
+                event.ignore()
+            else:
+                event.acceptProposedAction()
+                self._drop_hl(False)
+                self.open_path(p)
+            return True
+        return False
 
     def _monitor_work(self, hwnd) -> tuple[tuple[float, float, float, float], float] | None:
         """窗口**所在那台显示器**的可用区（物理像素）+ 真实缩放比。

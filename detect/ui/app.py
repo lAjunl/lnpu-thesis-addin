@@ -16,13 +16,38 @@ os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from .assets import app_icon_path
 from .main_window import MainWindow
 from .style import apply
+
+
+class App(QApplication):
+    """多做一件事：拦截全局拖拽事件。
+
+    Qt 的拖拽事件只投递给光标下的那个子控件，**不会往父窗口冒泡**，
+    而 installEventFilter 装在 QApplication 上也拦不到别的控件的事件。
+    所以只能重写 notify()——这是唯一能拦住所有控件拖拽事件的办法。
+    """
+
+    def __init__(self, argv):
+        super().__init__(argv)
+        self.main_window = None
+
+    def notify(self, receiver, event) -> bool:
+        w = self.main_window
+        if (w is not None and event.type() in (
+                QEvent.Type.DragEnter, QEvent.Type.DragMove,
+                QEvent.Type.DragLeave, QEvent.Type.Drop)):
+            try:
+                if w.handle_drag_event(event):
+                    return True
+            except Exception:
+                pass
+        return super().notify(receiver, event)
 
 
 def main() -> int:
@@ -33,7 +58,7 @@ def main() -> int:
     except Exception:
         pass
 
-    app = QApplication(sys.argv)
+    app = App(sys.argv)
     for attr in (
         "AA_EnableHighDpiScaling",
         "AA_UseHighDpiPixmaps",
@@ -51,6 +76,7 @@ def main() -> int:
 
     win = MainWindow()
     win.setWindowIcon(icon)
+    app.main_window = win
     win.show()
 
     # 命令行直接跟一个 docx 路径：双击/右键打开时自动载入

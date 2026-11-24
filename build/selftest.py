@@ -19,8 +19,8 @@ os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
-from PySide6.QtCore import Qt, QSizeF, QCoreApplication
-from PySide6.QtGui import QTextCursor, QTextDocument
+from PySide6.QtCore import Qt, QSizeF, QCoreApplication, QMimeData, QUrl, QPointF
+from PySide6.QtGui import QTextCursor, QTextDocument, QDropEvent
 from PySide6.QtWidgets import QApplication
 
 from detect.classify import analyze, effective_role
@@ -89,12 +89,14 @@ def main() -> int:
         )
     except Exception:
         pass
-    app = QApplication([])
+    from detect.ui.app import App
+    app = App([])
     apply(app)
 
     test_line_spacing()
 
     win = MainWindow()
+    app.main_window = win          # 拖拽拦截挂在 App 上，要指过来
     win.resize(1480, 880)
     win.show()
     app.processEvents()
@@ -382,6 +384,43 @@ def main() -> int:
         print("SKIP 超链接内的文字也统一字体（本文没有超链接）")
 
     check("编号写入", n_num > 0, f"{n_num} 个")
+
+    # ---- 拖拽打开：只认 .docx ----
+    class _DropEvt:
+        def __init__(self, urls):
+            self._urls = urls
+
+        def mimeData(self):
+            from PySide6.QtCore import QMimeData, QUrl
+            m = QMimeData()
+            m.setUrls([QUrl.fromLocalFile(u) for u in self._urls])
+            return m
+
+    p1 = win._drop_docx(_DropEvt([str(Path(src))]))
+    check("拖拽识别 .docx", p1 is not None and p1.suffix.lower() == ".docx",
+          str(p1))
+    check("拖拽拒绝非 docx", win._drop_docx(_DropEvt(["C:/x/a.txt"])) is None, "")
+    check("拖拽拒绝空内容", win._drop_docx(_DropEvt([])) is None, "")
+    check("拖放已开启", win.acceptDrops(), "")
+
+    # 端到端：把 Drop 事件发给子控件（真实拖拽就是投递给光标下的子控件），
+    # 由 App.notify() 拦截后打开文档
+    def _send_drop(target, path):
+        m = QMimeData()
+        m.setUrls([QUrl.fromLocalFile(str(path))] if path else [])
+        ev = QDropEvent(QPointF(400, 400), Qt.CopyAction, m,
+                        Qt.LeftButton, Qt.NoModifier)
+        QApplication.sendEvent(target, ev)
+        app.processEvents()
+
+    _send_drop(win.after_view, Path(src))
+    check("拖拽打开文档（投递给子控件）",
+          win.path is not None and win.path.suffix.lower() == ".docx",
+          str(win.path))
+    _send_drop(win.after_view, Path("C:/x/not_a_docx.txt"))
+    check("拖非 docx 不换文档",
+          win.path is not None and win.path.suffix.lower() == ".docx",
+          str(win.path))
 
     # 中文槽位必须是中文字体：旧版把 w:eastAsia 写成 Times New Roman，
     # 中文会回退成主题字体（实测"表格/正文字体不合适"）
