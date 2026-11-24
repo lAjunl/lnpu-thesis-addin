@@ -449,10 +449,10 @@ class LayoutDialog(_BaseDialog):
 
 
 class IndentDialog(_BaseDialog):
-    """中文缩进 / 段落顶格。"""
+    """正文缩进 / 段落顶格。"""
 
     def __init__(self, settings, parent=None, focus_not_indent: bool = False):
-        super().__init__("中文缩进 / 段落顶格", parent)
+        super().__init__("正文缩进 / 段落顶格", parent)
         self.chk = MarkCheck("正文首行缩进")
         self.chk.setChecked(settings.apply_indent)
         self.row("", self.chk)

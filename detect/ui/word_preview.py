@@ -72,6 +72,43 @@ class WordPreview:
             pass
         return found
 
+    def _alive(self) -> bool:
+        """Word 进程还在、COM 连接还有效？用户手关 Word 后这里会失败。"""
+        try:
+            if self._word is None:
+                return False
+            _ = self._word.Documents.Count
+            return True
+        except Exception:      # noqa: BLE001  (-2147023174 RPC 服务器不可用)
+            return False
+
+    def _reconnect(self) -> bool:
+        """COM 连接断了（Word 被关掉 / 崩溃）：重新拿实例并重开两份文档。"""
+        self._doc_o = self._doc_r = None
+        word = None
+        try:
+            word = self._app()
+            word.Visible = True
+            word.DisplayAlerts = 0
+            self._word = word
+            self._doc_o = word.Documents.Open(str(self.original), ReadOnly=True)
+            self._doc_r = word.Documents.Open(str(self.rendered), ReadOnly=False)
+            try:
+                word.Windows.Arrange(3)
+            except Exception:
+                pass
+            return True
+        except Exception:      # noqa: BLE001
+            # 重连失败时别把刚拉起来的空 Word 留在后台
+            try:
+                if word is not None and self._we_started \
+                        and word.Documents.Count == 0:
+                    word.Quit()
+            except Exception:
+                pass
+            self._word = None
+            return False
+
     # ---------------------------------------------------------------- #
     def open(self, render_fn) -> bool:
         """生成排版预览，并把两份文档并排打开。"""
@@ -110,6 +147,15 @@ class WordPreview:
         """
         if not self._ok:
             return False
+        # Word 被用户关掉或崩溃后旧 COM 引用会抛「RPC 服务器不可用」，
+        # 先探活；断了就重连并重开两份文档，而不是当场报错。
+        if not self._alive():
+            if not self._reconnect():
+                QMessageBox.warning(
+                    self.parent, "刷新预览失败",
+                    "Word 已被关闭，无法刷新预览。\n请重新点「在 Word 中对比」。")
+                return False
+
         # 先关掉 Word 里的预览文档再写文件，否则文件锁会让保存报 PermissionError。
         # 按文件名兜底，避免旧 COM 引用失效后关不掉。
         closed = False
@@ -126,7 +172,13 @@ class WordPreview:
                     if d.Name == RENDERED_NAME:
                         d.Close(False)
             except Exception:
-                pass
+                if self._reconnect():
+                    try:
+                        for d in list(self._word.Documents):
+                            if d.Name == RENDERED_NAME:
+                                d.Close(False)
+                    except Exception:
+                        pass
         self._doc_r = None
 
         try:
@@ -136,18 +188,28 @@ class WordPreview:
             return False
         try:
             self._doc_r = self._word.Documents.Open(str(self.rendered), ReadOnly=False)
+        except Exception:  # noqa: BLE001
+            # 写文件的这几秒里 Word 可能又被关了：重连一次再试
+            if not self._reconnect():
+                QMessageBox.warning(
+                    self.parent, "刷新预览失败",
+                    "Word 连接已断开，请重新点「在 Word 中对比」。")
+                return False
             try:
-                self._doc_r.Activate()
-            except Exception:
-                pass
-            try:
-                self._word.Windows.Arrange(3)
-            except Exception:
-                pass
-            return True
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self.parent, "刷新预览失败", str(exc))
-            return False
+                self._doc_r = self._word.Documents.Open(str(self.rendered),
+                                                        ReadOnly=False)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(self.parent, "刷新预览失败", str(exc))
+                return False
+        try:
+            self._doc_r.Activate()
+        except Exception:
+            pass
+        try:
+            self._word.Windows.Arrange(3)
+        except Exception:
+            pass
+        return True
 
     # ---------------------------------------------------------------- #
     def close(self) -> None:

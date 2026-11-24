@@ -470,14 +470,14 @@ def body_baseline(feats: list[ParaFeatures]) -> dict:
         long_paras = [f for f in feats if f.char_len >= 20] or feats
     sizes = Counter(f.size_pt for f in long_paras if f.size_pt is not None)
     lines = Counter(f.line_rule for f in long_paras if f.line_rule is not None)
+    values = Counter(f.line_value for f in long_paras if f.line_value is not None)
     aligns = Counter(f.align for f in long_paras if f.align is not None)
     bolds = Counter(f.bold for f in long_paras)
     return {
         "size": sizes.most_common(1)[0][0] if sizes else None,
         "line_rule": lines.most_common(1)[0][0] if lines else None,
-        "line_value": Counter(
-            f.line_value for f in long_paras if f.line_value is not None
-        ).most_common(1)[0][0] if long_paras else None,
+        # 段落都没写行距时 values 是空的，按 long_paras 判断会 IndexError
+        "line_value": values.most_common(1)[0][0] if values else None,
         "align": aligns.most_common(1)[0][0] if aligns else None,
         "bold": bolds.most_common(1)[0][0] if bolds else False,
         "n": len(long_paras),

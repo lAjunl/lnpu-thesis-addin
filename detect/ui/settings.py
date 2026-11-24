@@ -94,7 +94,7 @@ COLOR_CHOICES = [("", "自动（黑）"), ("000000", "黑色"), ("333333", "深�
 # Ribbon 分组定义：(组名, [(按钮 key, 显示名)])
 # 每组 3~4 个，标题一律固定在卡片底部（见 main_window._ribbon）
 RIBBON_GROUPS = [
-    ("版面", [("page", "页面设置"), ("indent", "中文缩进"),
+    ("版面", [("page", "页面设置"), ("indent", "正文缩进"),
              ("not_indent", "段落顶格"), ("meta", "作者信息")]),
     ("标题", [("title", "论文题目"), ("heading1", "一级标题"),
               ("heading2", "二级标题"), ("heading3", "三级标题")]),
@@ -112,7 +112,7 @@ RIBBON_GROUPS = [
 
 # 期刊论文：没有目录、不分节。目录卡片仍然显示但置灰（用户要求"能看到但点不了"）。
 RIBBON_GROUPS_JOURNAL = [
-    ("版面", [("page", "页面设置"), ("indent", "中文缩进"),
+    ("版面", [("page", "页面设置"), ("indent", "正文缩进"),
              ("not_indent", "段落顶格"), ("meta", "作者信息")]),
     ("标题", [("title", "论文题目"), ("heading1", "一级标题"),
               ("heading2", "二级标题"), ("heading3", "三级标题")]),
@@ -268,7 +268,7 @@ class Settings:
     enable_number_heading: bool = True
     enable_number_figure: bool = True
     enable_number_table: bool = True
-    # 中文缩进（首行缩进字符数）
+    # 正文缩进（首行缩进字符数）
     first_line_indent_chars: float = 2.0
     apply_indent: bool = True
     # 段落顶格（取消首行缩进）

@@ -107,6 +107,8 @@ RE_FIG_WEAK = re.compile(r"^\s*(图|figure|fig\.?)\s*\d+", re.I)
 RE_TAB_WEAK = re.compile(r"^\s*(表|table)\s*\d+", re.I)
 
 RE_EQN = re.compile(r"^[（(]\s*式\s*\d+(?:\.\d+)?\s*[)）]")
+# 公式编号，如 "(1)"、"（4-1）"、"（A.2）"
+RE_EQ_LABEL = re.compile(r"^[（(]\s*[\w.\-–—]{1,12}\s*[)）][.。]?$")
 RE_REF = re.compile(r"^\s*\[\d+\]")
 RE_REF_ZONE = re.compile(r"^\s*(references|参考文献)\s*$", re.I)
 
@@ -369,13 +371,15 @@ def classify(
         if f.in_table:
             out.append(Detection(f.index, "table", 0.95, ["位于表格内"]))
             continue
-        if f.has_math:
-            out.append(Detection(f.index, "equation", 0.95, ["段落内含公式对象（OMML）"]))
-            continue
-        if f.has_ole:
-            out.append(Detection(f.index, "equation", 0.9,
-                                 ["段落内含 OLE 对象（MathType 公式）"]))
-            continue
+        if f.has_math or f.has_ole:
+            # 只有"公式独占一段"才算公式段。公式夹在句子里（行内公式）时，
+            # 这段仍然是正文——否则会被居中、换行距，Word 里整段都排错。
+            rest = (f.text or "").replace("\t", " ").strip()
+            if not rest or RE_EQ_LABEL.match(rest):
+                what = "OMML" if f.has_math else "MathType"
+                out.append(Detection(f.index, "equation", 0.95,
+                                     [f"段落只含公式对象（{what}）"]))
+                continue
         # 空段落永远不是标题：旧规则 "字数≤65 且词数≤12" 把 0 字也放进来，
         # 实测 manuscript 里 8 个空段落被编成一级标题、各占一个章号。
         if f.char_len == 0:

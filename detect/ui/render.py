@@ -339,19 +339,22 @@ def _insert_image(cur: QTextCursor, blob: bytes, content_w: float,
         pass
 
 
-def _insert_equation(cur: QTextCursor, im: QImage, number: str,
+def _insert_equation(cur: QTextCursor, im, number: str,
                      content_w: float, latin: str, size: float, bold: bool,
                      color: str) -> None:
     """公式 + 编号：编号右对齐，和公式同一行（Word 的排法）。
 
+    im 可以是单张图，也可以是同段里的多张（按顺序横排）。
     用 1 行 2 列的无边框表格：左列居中放公式，右列右对齐放编号。
     没有编号就只画公式。
     """
+    ims = im if isinstance(im, (list, tuple)) else [im]
     if not number:
         bf = QTextBlockFormat()
         bf.setAlignment(Qt.AlignHCenter)
         cur.insertBlock(bf)
-        cur.insertImage(im)
+        for one in ims:
+            cur.insertImage(one)
         return
     try:
         num_w = 80.0
@@ -370,7 +373,8 @@ def _insert_equation(cur: QTextCursor, im: QImage, number: str,
         bf0 = QTextBlockFormat()
         bf0.setAlignment(Qt.AlignHCenter)
         cur0.setBlockFormat(bf0)
-        cur0.insertImage(im)
+        for one in ims:
+            cur0.insertImage(one)
 
         c1 = t.cellAt(0, 1)
         cur1 = c1.firstCursorPosition()
@@ -383,7 +387,158 @@ def _insert_equation(cur: QTextCursor, im: QImage, number: str,
         bf = QTextBlockFormat()
         bf.setAlignment(Qt.AlignHCenter)
         cur.insertBlock(bf)
-        cur.insertImage(im)
+        for one in ims:
+            cur.insertImage(one)
+
+
+_EQ_NUM_RE = re.compile(r"^[\(（]\s*[\w.\-–—]+\s*[\)）][.。]?$")
+_VML_IMG = "{urn:schemas-microsoft-com:vml}imagedata"
+_RID = ("{http://schemas.openxmlformats.org/officeDocument/2006/"
+        "relationships}id")
+
+
+def _has_field(p) -> bool:
+    return (p._p.find(".//" + qn("w:fldChar")) is not None
+            or p._p.find(".//" + qn("w:fldSimple")) is not None)
+
+
+def _object_natural(obj) -> tuple[float, float] | None:
+    """w:object 的原始尺寸（磅），来自 dxaOrig/dyaOrig（twips）。"""
+    w, h = obj.get(qn("w:dxaOrig")), obj.get(qn("w:dyaOrig"))
+    if not w or not h:
+        return None
+    try:
+        return int(w) / 20.0, int(h) / 20.0
+    except ValueError:
+        return None
+
+
+def _object_blob(p, obj) -> bytes | None:
+    """某个 w:object 自己的公式图片（v:imagedata 的 r:id）。"""
+    for im in obj.iter(_VML_IMG):
+        rid = im.get(_RID)
+        if not rid:
+            continue
+        try:
+            part = p.part.related_parts.get(rid)
+            return part.blob if part is not None else None
+        except Exception:
+            return None
+    return None
+
+
+def _formula_images(p, content_w: float, size: float, latin: str,
+                    bold: bool) -> list[QImage]:
+    """把段落里的公式按文档顺序渲染成图片：OMML 走自绘，MathType 走 EMF。
+
+    一段里可以有多条（行内公式常见「式(1)和式(2)」），顺序和段落一致。
+    """
+    out: list[QImage] = []
+    m_math = qn("m:oMath")
+    m_para = qn("m:oMathPara")
+    w_obj = qn("w:object")
+    for el in p._p.iter():
+        if el.tag in (m_math, m_para):
+            par = el.getparent()
+            if el.tag == m_math and par is not None and par.tag == m_para:
+                continue            # oMathPara 是容器，只画外层
+            from ..omml import render_element
+            try:
+                im = render_element(el, size, latin, bold)
+            except Exception:      # noqa: BLE001  单条公式画不出来不影响整页
+                im = None
+            if im is not None:
+                out.append(im)
+        elif el.tag == w_obj:
+            blob = _object_blob(p, el)
+            if not blob:
+                continue
+            from ..emf import emf_to_png
+            natural = _object_natural(el)
+            target = int(natural[0] * 6) if natural else int(content_w * 6)
+            png = emf_to_png(blob, max(64, target))
+            if png is None:
+                continue
+            im = _load_image(Path(png).read_bytes(), content_w, natural)
+            if im is not None:
+                out.append(im)
+    return out
+
+
+def _standalone_formula(p, f, n_images: int) -> bool:
+    """这段公式是「独占一行的显示公式」还是「句子里的行内公式」。
+
+    显示公式：段里只有公式对象 + 编号（"(1)" / "(4-1)"，编号常是 Word 域），
+    这类要按「中间公式 + 右侧编号」排。
+    行内公式：公式前后还有正文，必须留在同一行里。
+    """
+    txt = (f.text or "").replace("\t", " ").strip()
+    if not txt:
+        return True
+    if n_images != 1:
+        return False
+    if _EQ_NUM_RE.match(txt):
+        return True
+    # 有公式编号域时，段里的文字可能只剩编号（域结果），也算显示公式
+    if _has_field(p):
+        from ..features import equation_label
+        label = equation_label(p).replace("\t", " ").strip()
+        return bool(label) and txt == label and len(txt) <= 12
+    return False
+
+
+def _run_line_text(r) -> str:
+    """一个 w:r 里能显示成文字的部分（w:t / 制表符 / 换行）。"""
+    out = []
+    for ch in r:
+        if ch.tag == qn("w:t"):
+            out.append(ch.text or "")
+        elif ch.tag == qn("w:tab"):
+            out.append("    ")
+        elif ch.tag in (qn("w:br"), qn("w:cr")):
+            out.append(" ")
+    return "".join(out)
+
+
+_INLINE_CONTAINERS = {qn(t) for t in (
+    "w:hyperlink", "w:smartTag", "w:ins", "w:sdt", "w:sdtContent",
+    "w:fldSimple", "w:customXml")}
+
+
+def _insert_inline_formula(cur: QTextCursor, p, ims: list[QImage],
+                           cjk: str, latin: str, size: float, bold: bool,
+                           color: str) -> None:
+    """行内公式：按原段落顺序把「文字 → 公式图 → 文字」铺进同一段落。"""
+    state = {"i": 0, "used": False}
+
+    def walk(el) -> None:
+        for ch in el:
+            tag = ch.tag
+            if tag in (qn("m:oMath"), qn("m:oMathPara")):
+                if state["i"] < len(ims):
+                    cur.insertImage(ims[state["i"]])
+                    state["used"] = True
+                state["i"] += 1
+                continue
+            if tag == qn("w:r"):
+                if ch.find(".//" + qn("w:object")) is not None:
+                    if state["i"] < len(ims):
+                        cur.insertImage(ims[state["i"]])
+                        state["used"] = True
+                    state["i"] += 1
+                else:
+                    txt = _run_line_text(ch)
+                    if txt:
+                        _insert_runs(cur, txt, cjk, latin, size, bold, color)
+                continue
+            if tag in _INLINE_CONTAINERS:
+                walk(ch)
+
+    walk(p._p)
+    if not state["used"]:
+        for im in ims:
+            cur.insertImage(im)
+            return
 
 
 _IMG_CACHE: dict[tuple, QImage] = {}
@@ -666,17 +821,12 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
                                float(p.get("line", 22)), natural)
             color = p.get("color") or ""
             align = p.get("align", "left")
-            indent_pt = (
-                float(settings.first_line_indent_chars) * size
-                if role == "body" and settings.apply_indent and not settings.apply_not_indent
-                else 0.0
-            )
+            from ..reflow import indent_chars_of
+            indent_pt = (indent_chars_of(settings) * size
+                         if role == "body" else 0.0)
             label_bold = bool(getattr(settings, "bold_label", False)) \
                 and role in LABEL_ROLES
             text = f.text
-            if f.has_math:
-                from ..features import _math_text
-                text = _math_text(doc.paragraphs[i]) or "（公式）"
             if i in head_plans:
                 text = head_plans[i] + clean_heading(text)
             elif i in fig_plans:
@@ -684,9 +834,31 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
             elif i in tab_plans:
                 text = tab_plans[i] + clean_caption(text, aggressive=True)
 
-        _insert_paragraph(cur, text, cjk, latin, size, bold, line_pt, align, indent_pt,
-                          color, marks_on, label_bold)
-        block_of[i] = cur.block()
+        # ---- 公式：OMML 自绘 / MathType 走 EMF，按文档顺序全部渲染成图 ----
+        formula_ims = (_formula_images(doc.paragraphs[i], content_w, size,
+                                       latin, bold)
+                       if (f.has_math or f.has_ole) else [])
+        standalone = bool(formula_ims) and _standalone_formula(
+            doc.paragraphs[i], f, len(formula_ims))
+        if not formula_ims and f.has_math and side != "before":
+            from ..features import _math_text
+            text = _math_text(doc.paragraphs[i]) or "（公式）"
+
+        if formula_ims and not standalone:
+            # 行内公式：文字和公式图按原文顺序铺在同一段里。
+            # 图比行距高时把这一段的固定行距抬到图高，否则公式会压到上一行
+            im_h = max(float(im.deviceIndependentSize().height())
+                       for im in formula_ims)
+            line_pt = max(line_pt, im_h + 2.0)
+            _insert_paragraph(cur, "", cjk, latin, size, bold, line_pt, align,
+                              indent_pt, color, False, False)
+            block_of[i] = cur.block()
+            _insert_inline_formula(cur, doc.paragraphs[i], formula_ims,
+                                   cjk, latin, size, bold, color)
+        else:
+            _insert_paragraph(cur, text, cjk, latin, size, bold, line_pt, align,
+                              indent_pt, color, marks_on, label_bold)
+            block_of[i] = cur.block()
 
         if f.has_image:
             from ..features import image_size
@@ -694,28 +866,15 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
             if blob:
                 _insert_image(cur, blob, content_w,
                               image_size(doc.paragraphs[i]))
-        elif f.has_ole:
-            from ..features import ole_image_blob, ole_size, equation_label
-            from ..emf import emf_to_png
-            blob = ole_image_blob(doc.paragraphs[i])
-            osize = ole_size(doc.paragraphs[i])
-            nw = osize[0] if osize else None
-            png = emf_to_png(blob, int(nw * 6) if nw else int(content_w * 6)) \
-                if blob else None
-            if png is not None:
-                im = _load_image(Path(png).read_bytes(), content_w, osize)
-                if im is not None:
-                    # 公式 + 编号同一行（编号右对齐）
-                    _insert_equation(cur, im,
-                                     equation_label(doc.paragraphs[i]),
-                                     content_w, latin, size, bold, color)
-                else:
-                    _insert_paragraph(cur, "（公式）", FALLBACK_CJK,
-                                      FALLBACK_LATIN, 12.0, False, 15.0,
-                                      "center", 0.0, "", False)
-            else:
-                _insert_paragraph(cur, "（公式）", FALLBACK_CJK, FALLBACK_LATIN,
-                                  12.0, False, 15.0, "center", 0.0, "", False)
+        elif formula_ims and standalone:
+            # 显示公式 + 编号同一行（编号右对齐）
+            from ..features import equation_label
+            _insert_equation(cur, formula_ims,
+                             equation_label(doc.paragraphs[i]),
+                             content_w, latin, size, bold, color)
+        elif f.has_ole and not formula_ims and not text.strip():
+            _insert_paragraph(cur, "（公式）", FALLBACK_CJK, FALLBACK_LATIN,
+                              12.0, False, 15.0, "center", 0.0, "", False)
         else:
             shown += 1
 

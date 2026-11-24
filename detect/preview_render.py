@@ -52,8 +52,11 @@ def render_preview(source: Path, settings, out_path: Path,
 
         configure(d, plans_from_settings(settings), settings)
 
+    from .reflow import indent_chars_of
+
     stats = apply_formats(d, a, settings.roles, overrides=overrides,
-                          label_bold=bool(getattr(settings, "bold_label", False)))
+                          label_bold=bool(getattr(settings, "bold_label", False)),
+                          indent_chars=indent_chars_of(settings))
     from .reflow import style_tables
     style_tables(d, settings)
     if getattr(settings, "enable_marks", True):

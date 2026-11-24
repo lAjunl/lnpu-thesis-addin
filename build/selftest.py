@@ -712,6 +712,38 @@ def main() -> int:
     check("排版后预览已刷新", "已排版" in win.after_head.text(),
           win.after_head.text())
 
+    # ---- 缩进 / 公式制表位要真正写进 docx（以前只在预览里改了）----
+    from docx.oxml.ns import qn as _qn
+    from detect.classify import effective_role as _er
+
+    body_idx = [d.index for d in win.analysis.detections if _er(d) == "body"]
+    n_ind = 0
+    for i in body_idx:
+        pPr = win.doc.paragraphs[i]._p.pPr
+        ind = pPr.find(_qn("w:ind")) if pPr is not None else None
+        if ind is not None and ind.get(_qn("w:firstLineChars")):
+            n_ind += 1
+    if body_idx:
+        check("正文首行缩进写入 docx", n_ind == len(body_idx),
+              f"{n_ind}/{len(body_idx)} 段带 firstLineChars")
+
+    eq_idx = [d.index for d in win.analysis.detections if _er(d) == "equation"]
+    if eq_idx:
+        tabbed = 0
+        for i in eq_idx:
+            pPr = win.doc.paragraphs[i]._p.pPr
+            tabs = pPr.find(_qn("w:tabs")) if pPr is not None else None
+            if tabs is not None:
+                tabbed += 1
+        check("公式编号有制表位（右对齐）", tabbed > 0, f"{tabbed}/{len(eq_idx)} 段")
+
+    inline_math = [i for i, fd in enumerate(win.analysis.features)
+                   if (fd.has_math or fd.has_ole) and fd.text.strip()]
+    if inline_math:
+        role_by_idx = {d.index: _er(d) for d in win.analysis.detections}
+        ok = all(role_by_idx.get(i) != "equation" for i in inline_math)
+        check("行内公式段落不算公式段", ok, f"{len(inline_math)} 段")
+
     # 另存为：把保存框引到临时文件，绝不覆盖用户的稿子
     alt = Path(tempfile.mkdtemp(prefix="selftest_save_")) / "另存为.docx"
     QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (str(alt), ""))

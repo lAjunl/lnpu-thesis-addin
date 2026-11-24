@@ -1082,11 +1082,12 @@ class MainWindow(QMainWindow):
                 from ..sections import configure
 
                 configure(self.doc, plans_from_settings(self.settings), self.settings)
-            from ..reflow import style_tables
+            from ..reflow import indent_chars_of, style_tables
 
             stats = apply_formats(self.doc, self.analysis, self.settings.roles,
                                     overrides=self.overrides,
-                                    label_bold=bool(self.settings.bold_label))
+                                    label_bold=bool(self.settings.bold_label),
+                                    indent_chars=indent_chars_of(self.settings))
             style_tables(self.doc, self.settings)
             if self.settings.enable_marks:
                 from ..marks import apply_marks

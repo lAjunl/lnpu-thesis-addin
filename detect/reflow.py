@@ -112,6 +112,63 @@ def _set_line_spacing(para, p: dict) -> None:
         pass
 
 
+def _set_first_indent(para, chars: float | None, size: float = 12.0) -> None:
+    """正文首行缩进：chars 个字符（None = 顶格，清掉缩进）。
+
+    同时写 `w:firstLineChars` 和 `w:firstLine`：
+    Word 优先按字符数缩进（换字号也是"2 个字"），`w:firstLine` 只是兜底，
+    给不认 Chars 属性的软件用。两种写法都要先清掉原来的 hanging。
+    """
+    pPr = para._p.get_or_add_pPr()
+    ind = pPr.find(qn("w:ind"))
+    if ind is None:
+        if not chars:
+            return
+        ind = pPr.get_or_add_ind()
+    for attr in ("w:firstLineChars", "w:firstLine", "w:hanging",
+                 "w:hangingChars"):
+        if ind.get(qn(attr)) is not None:
+            del ind.attrib[qn(attr)]
+    if chars and chars > 0:
+        ind.set(qn("w:firstLineChars"), str(int(round(chars * 100))))
+        ind.set(qn("w:firstLine"), str(int(round(chars * size * 20))))
+
+
+def _set_equation_tabs(para, content_twips: float) -> None:
+    """公式段落：写「居中 + 右对齐」两个制表位，编号才贴得到右边距。
+
+    Word 里"公式 + 右编号"靠制表符分列（MathType 就这么排），
+    源文件常常只剩制表符、没有制表位 → 编号紧跟在公式后面。
+    这里按正文栏宽重写制表位，并把段落改成左对齐（制表位才有意义）。
+    """
+    p_el = para._p
+    if content_twips <= 0 or p_el.find(".//" + qn("w:tab")) is None:
+        return
+    from .features import equation_label
+    if not equation_label(para):
+        return                       # 无编号的居中公式，不掺和
+    pPr = p_el.get_or_add_pPr()
+    for old in pPr.findall(qn("w:tabs")):
+        pPr.remove(old)
+    tabs = pPr.get_or_add_tabs()
+    for pos, val in ((content_twips / 2.0, "center"),
+                     (content_twips, "right")):
+        el = OxmlElement("w:tab")
+        el.set(qn("w:val"), val)
+        el.set(qn("w:pos"), str(int(round(pos))))
+        tabs.append(el)
+    para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+
+def indent_chars_of(settings) -> float:
+    """从设置里算正文首行缩进字符数：0 表示顶格。预览和排版共用这一口径。"""
+    if getattr(settings, "apply_not_indent", False):
+        return 0.0
+    if not getattr(settings, "apply_indent", True):
+        return 0.0
+    return max(0.0, float(getattr(settings, "first_line_indent_chars", 2.0) or 0.0))
+
+
 def _bold_leading_label(para, base_bold: bool = False) -> bool:
     """把段落开头的 "Abstract:" / "关键词:" 标签加粗，正文部分不动。
 
@@ -145,13 +202,20 @@ def _bold_leading_label(para, base_bold: bool = False) -> bool:
 
 
 def _apply_para(para, p: dict, role: str | None = None,
-                label_bold: bool = False) -> None:
-    """把一份格式字典写进一个段落（行距/对齐 + 字体/字号/加粗/字色）。"""
+                label_bold: bool = False, indent_chars: float | None = None) -> None:
+    """把一份格式字典写进一个段落（行距/对齐/首行缩进 + 字体/字号/加粗/字色）。
+
+    indent_chars: 正文段落的首行缩进字符数。None = 不处理，0 = 顶格（清掉缩进）。
+    只作用于 body：其它角色（尤其参考文献的悬挂缩进）不能被改。
+    """
     pf = para.paragraph_format
     _set_line_spacing(para, p)
     align = ALIGN_MAP.get(p.get("align", "left"))
     if align is not None:
         pf.alignment = align
+    if role == "body" and indent_chars is not None:
+        _set_first_indent(para, indent_chars,
+                          float(p.get("size", 12) or 12))
 
     # 字色：留空表示"不指定"（沿用 Word 的自动色），写 w:color 会覆盖掉
     color = (p.get("color") or "").strip()
@@ -302,13 +366,24 @@ def _remove_color(run) -> None:
 
 def apply_formats(doc, analysis, params: dict,
                   overrides: dict | None = None,
-                  label_bold: bool = False) -> dict:
+                  label_bold: bool = False,
+                  indent_chars: float | None = None) -> dict:
     """按角色套格式。返回统计 {角色: 段数}。
 
     overrides: {段索引: 格式字典}，用户在预览里手动改的段落，
     在该段上覆盖角色格式（相当于 Word 的"直接格式"）。
     label_bold: 是否把段落开头的 Abstract: / 关键词: 标签加粗。
+    indent_chars: 正文首行缩进字符数，用 indent_chars_of(settings) 算，
+                  None = 不动缩进。
     """
+    content_twips = 0.0
+    try:
+        sec = doc.sections[0]
+        content_twips = (float(sec.page_width) - float(sec.left_margin)
+                         - float(sec.right_margin)) / 635.0   # EMU → twips
+    except Exception:
+        content_twips = 0.0
+
     stats: dict[str, int] = {}
     for d in analysis.detections:
         role = effective_role(d)
@@ -320,6 +395,8 @@ def apply_formats(doc, analysis, params: dict,
         if ov:
             p.update({k: v for k, v in ov.items() if v is not None})
         _apply_para(doc.paragraphs[d.index], p, role=role,
-                    label_bold=label_bold)
+                    label_bold=label_bold, indent_chars=indent_chars)
+        if role == "equation":
+            _set_equation_tabs(doc.paragraphs[d.index], content_twips)
         stats[role] = stats.get(role, 0) + 1
     return stats
