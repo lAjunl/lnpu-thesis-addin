@@ -24,8 +24,8 @@ class DemoWidget(QWidget):
         self.kind = kind
         heights = {
             "page": 190, "indent": 118, "topalign": 108, "number": 150,
-            "caption_fig": 110, "caption_tab": 132, "section": 132,
-            "pagenum": 96, "header": 96,
+            "caption_fig": 110, "caption_tab": 132, "table": 124,
+            "section": 132, "pagenum": 96, "header": 96,
         }
         self.setMinimumHeight(heights.get(kind, 120))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -44,6 +44,7 @@ class DemoWidget(QWidget):
                 "number": self._number,
                 "caption_fig": self._caption_fig,
                 "caption_tab": self._caption_tab,
+                "table": self._table,
                 "section": self._section,
                 "pagenum": self._pagenum,
                 "header": self._header,
@@ -218,6 +219,61 @@ class DemoWidget(QWidget):
         for i in range(1, 3):
             p.drawLine(int(x), int(top + i * 14), int(x + w), int(top + i * 14))
         p.drawLine(int(x + w / 2), int(top), int(x + w / 2), int(top + 3 * 14))
+
+    def _table(self, p: QPainter) -> None:
+        d = self.data
+        style = d.get("style") or "three_line"
+        outer = max(0.0, float(d.get("outer", 1.5) or 0))
+        inner = max(0.0, float(d.get("inner", 0.75) or 0))
+        w = min(self.width() - 48, 280)
+        x = (self.width() - w) / 2
+        y0 = 18
+        rh = 22
+        rows = 3
+        y_end = y0 + rows * rh
+        cols = ["项目", "指标 A", "指标 B"]
+        vals = [["样本 1", "12.4", "0.85"], ["样本 2", "15.8", "0.92"]]
+
+        # 画表线
+        if style == "three_line":
+            if outer > 0:
+                p.setPen(QPen(INK, outer))
+                p.drawLine(int(x), int(y0), int(x + w), int(y0))
+                p.drawLine(int(x), int(y_end), int(x + w), int(y_end))
+            hw = inner if inner > 0 else outer
+            if hw > 0:
+                p.setPen(QPen(INK, hw))
+                p.drawLine(int(x), int(y0 + rh), int(x + w), int(y0 + rh))
+        elif style == "grid":
+            iw = inner if inner > 0 else outer
+            if iw > 0:
+                p.setPen(QPen(INK, iw))
+                for r in range(1, rows):
+                    p.drawLine(int(x), int(y0 + r * rh), int(x + w), int(y0 + r * rh))
+                for c in range(1, 3):
+                    cx = x + w * c / 3
+                    p.drawLine(int(cx), int(y0), int(cx), int(y_end))
+            if outer > 0:
+                p.setPen(QPen(INK, outer))
+                p.drawRect(int(x), int(y0), int(w), int(rows * rh))
+        else:
+            p.setPen(QPen(LINE, 1, Qt.PenStyle.DashLine))
+            p.drawRect(int(x), int(y0), int(w), int(rows * rh))
+
+        # 单元格示意文字
+        all_rows = [cols] + vals
+        for r, row_txts in enumerate(all_rows):
+            for c, txt in enumerate(row_txts):
+                cx = x + w * c / 3 + 10
+                cy = y0 + r * rh + 15
+                self._label(p, cx, cy, txt, INK, 9.5, r == 0)
+
+        note = {
+            "three_line": f"三线表：顶/底线 {outer:g} 磅（粗）· 栏目线 {inner:g} 磅（细）",
+            "grid": f"网格表：外框 {outer:g} 磅 · 内线 {inner:g} 磅",
+            "none": "无线表：不显示框线",
+        }.get(style, "")
+        self._label(p, x, y_end + 18, note, SUBTLE, 8.5)
 
     # ---------------------------------------------------------------- #
     # 分节 / 页码 / 页眉

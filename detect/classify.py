@@ -37,6 +37,8 @@ RE_HIGHLIGHTS = re.compile(
     r"\s*[:：]?\s*$", re.I)
 RE_KEYWORDS = re.compile(r"^\s*(关键词|keywords)\s*[:：]", re.I)
 RE_TOC_LINE = re.compile(r"^\s*(目\s*录|contents)\s*$", re.I)
+RE_TOC_STYLE = re.compile(r"^\s*(?:toc|目录)\s*(\d+)\s*$", re.I)
+RE_TOC_ENTRY = re.compile(r"(?:\t|[.·…]{3,})\s*\d+\s*$")
 
 # 尾注区：不是章节，不能占章号（否则「参考文献」会变成第 N 章）
 RE_BACK = re.compile(
@@ -124,8 +126,11 @@ RE_META = re.compile(
 # 编号
 # ------------------------------------------------------------------ #
 
-# 科技体系：1 / 1.1 / 1.1.1
-RE_TECH_NUM = re.compile(r"^\s*(\d+(?:\.\d+)*)\s*[.、．]?\s*(?:\S|$)")
+# 科技体系：1 / 1.1 / 1.1.1（排除 2026年11月 / 15% 等年份/数量行）
+RE_TECH_NUM = re.compile(
+    r"^\s*(\d{1,2}(?:\.\d{1,2})+)\s*[.、．]?\s*(?:\S|$)"
+    r"|^\s*(\d{1,2})(?:[.、．]\s*|\s+)(?![年月日%℃])(?:\S|$)"
+)
 
 # 公文式：一、 / （一） / 1. / （1）
 RE_CN_L1 = re.compile(r"^\s*([一二三四五六七八九十百零]+)\s*、")
@@ -168,7 +173,7 @@ def number_level(f: ParaFeatures, scheme: str) -> tuple[int | None, str | None]:
         return None, None
     m = RE_TECH_NUM.match(f.text)
     if m:
-        prefix = m.group(1)
+        prefix = m.group(1) or m.group(2)
         lvl = min(prefix.count(".") + 1, 3)
         return lvl, prefix
     return None, None
@@ -326,9 +331,14 @@ class Analysis:
 
 def _norm_style(name: str) -> str:
     n = name.strip().lower().replace("_", " ")
+    if RE_TOC_STYLE.match(n):
+        return "toc_item"
     if "heading" in n or "标题" in n:
-        m = re.search(r"(\d)", n)
-        return f"heading{m.group(1)}" if m else "heading"
+        m = re.search(r"(\d+)", n)
+        if m:
+            lvl = min(max(int(m.group(1)), 1), 3)
+            return f"heading{lvl}"
+        return "heading"
     if "caption" in n:
         if "figure" in n or "图" in n:
             return "figure_caption"
@@ -404,6 +414,17 @@ def classify(
         if RE_TOC_LINE.match(f.text):
             out.append(Detection(f.index, "toc", 0.9, ["目录标题"]))
             continue
+        m_toc = RE_TOC_STYLE.match(f.style_name) if f.style_name else None
+        if m_toc or f.is_toc_field:
+            if m_toc:
+                tlvl = min(max(int(m_toc.group(1)), 1), 3)
+            else:
+                lv_t, _ = number_level(f, scheme)
+                tlvl = lv_t or 1
+            why = [f"目录条目（样式 {f.style_name}）" if m_toc else "目录条目（Word TOC 域）"]
+            out.append(Detection(f.index, "toc_item", 0.95, why, level=tlvl,
+                                 level_confidence=0.95))
+            continue
         if RE_BACK.match(f.text):
             out.append(Detection(f.index, "back", 0.85,
                                  ["尾注区标题（不参与章号）"]))
@@ -448,40 +469,56 @@ def classify(
                 out.append(Detection(f.index, "table_caption", 0.6, ["紧邻图片的“表 N”短行"]))
                 continue
 
-        # ---------- 有样式线索 ----------
-        if use_style and f.style_name:
-            ns = _norm_style(f.style_name)
-            if ns in ("heading1", "heading2", "heading3"):
-                out.append(Detection(f.index, ns, 0.95, [f"样式 {f.style_name}"]))
-                continue
-            if ns in ("figure_caption", "table_caption", "caption"):
-                out.append(Detection(f.index, ns, 0.9, [f"样式 {f.style_name}"]))
-                continue
-            if ns == "title":
-                out.append(Detection(f.index, "title", 0.85, [f"样式 {f.style_name}"]))
-                continue
-            if ns == "body":
-                out.append(Detection(f.index, "body", 0.8, [f"样式 {f.style_name}"]))
-                continue
-
-        # ---------- 特征推断 ----------
         short = f.char_len <= 70
         no_end_punct = not f.ends_with_punct
         size = f.size_pt
         bigger = size is not None and body_size is not None and size > body_size + 0.5
         bolder = f.bold is True and body_bold is False
 
+        # 首段（以及紧跟在首段后面的多行大号居中封面标题）优先于样式判成题目：
+        # 很多工程报告/论文的封面标题用 Normal 样式手动放大字号，不能被 Normal 吞成正文
         if f.index == first_nonempty and (
                 bigger or bolder or f.align == "center" or f.word_count <= 15):
             out.append(Detection(f.index, "title", 0.7, ["首段且字号/加粗/居中突出"]))
             continue
-        # 放宽：首段够长又没有句末标点，即使字号/对齐都不突出也算题目。
-        # 实测 manuscript 题目是 12pt、左对齐、20+ 词，上面那条全不满足。
         if f.index == first_nonempty and f.char_len >= 40 and not f.ends_with_punct:
             out.append(Detection(f.index, "title", 0.6,
                                  [f"首段且 {f.char_len} 字、无句末标点"]))
             continue
+        if (out and out[-1].role == "title" and f.index <= (first_nonempty or 0) + 3
+                and size is not None and feats[out[-1].index].size_pt is not None
+                and abs(size - feats[out[-1].index].size_pt) <= 0.5
+                and size >= 18.0 and f.align == "center" and no_end_punct):
+            out.append(Detection(f.index, "title", 0.7, ["多行封面主标题续行"]))
+            continue
 
+        # ---------- 有样式线索 ----------
+        if use_style and f.style_name:
+            ns = _norm_style(f.style_name)
+            if ns in ("heading1", "heading2", "heading3"):
+                lvl = int(ns[-1])
+                _, num = number_level(f, scheme)
+                out.append(Detection(f.index, ns, 0.95, [f"样式 {f.style_name}"],
+                                     level=lvl, number=num, level_confidence=0.95))
+                continue
+            if ns in ("figure_caption", "table_caption", "caption"):
+                out.append(Detection(f.index, ns, 0.9, [f"样式 {f.style_name}"]))
+                continue
+            if ns == "title":
+                if f.index <= 15:
+                    out.append(Detection(f.index, "title", 0.85, [f"样式 {f.style_name}"]))
+                else:
+                    out.append(Detection(f.index, "other", 0.75, [f"非封面区的 {f.style_name} 样式"]))
+                continue
+            if RE_META.match(f.text):
+                out.append(Detection(f.index, "meta", 0.7, ["封面元数据行"]))
+                continue
+            # 文档本身已经规范使用 Heading 样式时，其余 Normal/自定义正文样式不再靠"短行"猜标题，
+            # 避免把缩略语表、标准清单误判成上百个标题
+            out.append(Detection(f.index, "body", 0.85, [f"样式 {f.style_name}"]))
+            continue
+
+        # ---------- 特征推断（仅无样式稿走此分支） ----------
         if RE_META.match(f.text):
             out.append(Detection(f.index, "meta", 0.7, ["封面元数据行"]))
             continue
@@ -515,10 +552,40 @@ def classify(
 
         out.append(Detection(f.index, "body", 0.6 if short else 0.85, ["无突出特征"]))
 
+    _mark_toc_entries(out, feats, scheme)
     _mark_cover_meta(out, feats)
     _demote_unnumbered_headings(out)
     _mark_abstract_body(out, feats)
     return out
+
+
+def _mark_toc_entries(out: list["Detection"], feats: list[ParaFeatures],
+                      scheme: str) -> None:
+    """无样式稿里的手工目录：紧跟在「目 录」后面、以制表符/点线+页码结尾的行标为 toc_item。"""
+    n = len(out)
+    i = 0
+    while i < n:
+        if out[i].role != "toc":
+            i += 1
+            continue
+        j = i + 1
+        while j < n:
+            f = feats[out[j].index]
+            if f.char_len == 0:
+                j += 1
+                continue
+            if out[j].role == "toc_item":
+                j += 1
+                continue
+            if RE_TOC_ENTRY.search(f.text) and f.char_len <= 100:
+                lv, _ = number_level(f, scheme)
+                out[j] = Detection(f.index, "toc_item", 0.9,
+                                   ["目录标题之后的页码行"], level=lv or 1,
+                                   level_confidence=0.85)
+                j += 1
+                continue
+            break
+        i = j
 
 
 def _demote_unnumbered_headings(out: list["Detection"]) -> int:
@@ -572,17 +639,25 @@ def _mark_cover_meta(out: list["Detection"], feats: list[ParaFeatures],
     title_i = next((i for i, d in enumerate(out) if d.role == "title"), None)
     if title_i is None:
         return
-    for j in range(title_i + 1, min(len(out), title_i + 1 + limit)):
+    seen = 0
+    for j in range(title_i + 1, min(len(out), title_i + 35)):
         d = out[j]
-        if d.role in ("abstract", "keywords", "toc", "back", "figure", "table",
-                      "equation", "reference", "meta"):
+        if d.role == "title":
+            continue
+        if d.role in ("abstract", "keywords", "toc", "toc_item", "back",
+                      "figure", "table", "equation", "reference", "meta"):
             break                      # 遇到真正的结构元素就停
         f = feats[d.index]
         if f.char_len == 0:
             continue
+        if d.role == "other":
+            break
+        seen += 1
+        if seen > limit:
+            break
         if f.char_len > 150 or f.ends_with_punct:
             break
-        if d.role in ("body", "other"):
+        if d.role == "body":
             out[j] = Detection(d.index, "meta", 0.65,
                                ["题目之后的作者/单位信息行"])
             continue
@@ -624,13 +699,22 @@ def _mark_abstract_body(out: list[Detection], feats: list[ParaFeatures] | None =
         i = j if j > i + 1 else i + 1
 
 
+def _has_heading_styles(feats: list[ParaFeatures]) -> bool:
+    """文档本身是否规范使用了 Word 的 Heading / 标题 样式（至少 3 个非空段）。"""
+    n = sum(1 for f in feats if f.char_len > 0 and f.style_name
+            and _norm_style(f.style_name) in ("heading1", "heading2", "heading3"))
+    return n >= 3
+
+
 def analyze(
     doc,
     source: str = "",
-    use_style: bool = False,
+    use_style: bool | None = None,
 ) -> Analysis:
     feats = extract_features(doc)
     scheme, stats = detect_scheme(feats)
+    if use_style is None:
+        use_style = _has_heading_styles(feats)
     dets = classify(feats, use_style=use_style, scheme=scheme)
 
     levels, confs, note = guess_levels(feats, dets, scheme)

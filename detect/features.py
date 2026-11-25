@@ -115,6 +115,8 @@ class ParaFeatures:
     has_image: bool = False
     has_math: bool = False          # 段落里含公式对象（OMML）
     has_ole: bool = False           # 段落里含 OLE 对象（MathType 公式等）
+    is_toc_field: bool = False      # Word 自动目录条目（PAGEREF _Toc 域）
+    left_indent_pt: float | None = None
     in_table: bool = False
     is_first: bool = False
 
@@ -155,11 +157,35 @@ def _align_of(pPr, chain) -> str | None:
     return None
 
 
+def _visible_runs(p: Paragraph) -> list[tuple[Any, str]]:
+    """返回段落里真正有可见文字的 (w:r, text)（含超链接内部，排除域指令）。
+
+    Word 目录标题「目  录」后面常紧跟一个隐藏的 `TOC \\o "1-2"` 域指令 run
+    （没有任何 w:t 文字、字号却是 12pt）；旧代码遍历 p.runs 会把这个隐藏 run
+    当成段落字号，把 16pt 标题错认成 12pt。同时 TOC 条目的正文藏在
+    w:hyperlink 里，不在 p.runs 里，这里一并扫出来。
+    """
+    out = []
+    for r_el in p._p.iter(qn("w:r")):
+        txt = "".join(t.text or "" for t in r_el.findall(qn("w:t")))
+        if txt:
+            out.append((r_el, txt))
+    return out
+
+
 def _size_pt(p: Paragraph, pPr, chain, doc_defaults_rpr) -> float | None:
-    # 1) 段落直接格式的 run
-    sizes = [r.font.size.pt for r in p.runs if r.font.size is not None]
-    if sizes:
-        return max(sizes)
+    """段落字号。run 级按**字符数加权**取众数，不用 max()——
+    一个 14 磅的空格 run 不该把整段（10 磅正文）顶成标题。"""
+    counter: dict[float, int] = {}
+    for r_el, txt in _visible_runs(p):
+        if not txt.strip():
+            continue
+        pt = _half_pt_to_pt(_find_in_pPr(_rpr_of(r_el), "sz"))
+        if pt is None:
+            continue
+        counter[pt] = counter.get(pt, 0) + len(txt.strip())
+    if counter:
+        return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
     # 2) 段落 pPr 的 rPr
     v = _half_pt_to_pt(_find_in_pPr(_rpr_of(pPr), "sz"))
     if v is not None:
@@ -169,15 +195,20 @@ def _size_pt(p: Paragraph, pPr, chain, doc_defaults_rpr) -> float | None:
         v = _half_pt_to_pt(_find_in_pPr(_style_rPr(st), "sz"))
         if v is not None:
             return v
-    # 4) docDefaults
+    # 4) docDefaults（很多稿子的默认字体/字号只写在这里）
     return _half_pt_to_pt(_find_in_pPr(doc_defaults_rpr, "sz"))
 
 
-def _bold_of(p: Paragraph, pPr, chain) -> bool | None:
-    for r in p.runs:
-        if r.bold is not None:
-            return bool(r.bold)
-    for el in (_rpr_of(pPr), *[_style_rPr(st) for st in chain]):
+def _bold_of(p: Paragraph, pPr, chain, doc_defaults_rpr=None) -> bool | None:
+    for r_el, txt in _visible_runs(p):
+        if not txt.strip():
+            continue
+        b = _find_in_pPr(_rpr_of(r_el), "b")
+        if b is not None:
+            v = _get_w(b, "val")
+            return True if v is None else v not in ("0", "false", "off")
+    for el in (_rpr_of(pPr), *[_style_rPr(st) for st in chain],
+               doc_defaults_rpr):
         b = _find_in_pPr(el, "b")
         if b is not None:
             v = _get_w(b, "val")
@@ -187,15 +218,17 @@ def _bold_of(p: Paragraph, pPr, chain) -> bool | None:
     return None
 
 
-def _east_asia_of(p: Paragraph, pPr, chain) -> str:
-    for r in p.runs:
-        rPr = r._r.find(qn("w:rPr"))
+def _east_asia_of(p: Paragraph, pPr, chain, doc_defaults_rpr=None) -> str:
+    for r_el, txt in _visible_runs(p):
+        if not txt.strip():
+            continue
+        rPr = _rpr_of(r_el)
         if rPr is not None:
             rf = rPr.find(qn("w:rFonts"))
             if rf is not None and rf.get(qn("w:eastAsia")):
                 return rf.get(qn("w:eastAsia"))
-    candidates = [_rpr_of(pPr), *[_style_rPr(st) for st in chain]]
-    for el in candidates:
+    for el in (_rpr_of(pPr), *[_style_rPr(st) for st in chain],
+               doc_defaults_rpr):
         if el is None:
             continue
         rf = el.find(qn("w:rFonts"))
@@ -204,12 +237,19 @@ def _east_asia_of(p: Paragraph, pPr, chain) -> str:
     return ""
 
 
-def _ascii_of(p: Paragraph, pPr, chain) -> str:
-    for r in p.runs:
-        if r.font.name:
-            return r.font.name
-    candidates = [_rpr_of(pPr), *[_style_rPr(st) for st in chain]]
-    for el in candidates:
+def _ascii_of(p: Paragraph, pPr, chain, doc_defaults_rpr=None) -> str:
+    for r_el, txt in _visible_runs(p):
+        if not txt.strip():
+            continue
+        rPr = _rpr_of(r_el)
+        if rPr is not None:
+            rf = rPr.find(qn("w:rFonts"))
+            if rf is not None:
+                v = rf.get(qn("w:ascii")) or rf.get(qn("w:hAnsi"))
+                if v:
+                    return v
+    for el in (_rpr_of(pPr), *[_style_rPr(st) for st in chain],
+               doc_defaults_rpr):
         if el is None:
             continue
         rf = el.find(qn("w:rFonts"))
@@ -218,9 +258,9 @@ def _ascii_of(p: Paragraph, pPr, chain) -> str:
     return ""
 
 
-def _line_of(pPr, chain):
+def _line_of(pPr, chain, defaults_pPr=None):
     """返回 (rule, value)。rule ∈ exactly / multiple / at_least / single / None。"""
-    for el in [pPr, *[_style_pPr(st) for st in chain]]:
+    for el in [pPr, *[_style_pPr(st) for st in chain], defaults_pPr]:
         sp = _find_in_pPr(el, "spacing")
         if sp is None:
             continue
@@ -295,8 +335,49 @@ def ole_size(p: Paragraph):
     return None
 
 
+def _parse_css_pt(val: str) -> float | None:
+    m = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(pt|in|cm|mm|px)?\s*$", val or "", re.I)
+    if not m:
+        return None
+    v = float(m.group(1))
+    u = (m.group(2) or "pt").lower()
+    if u == "pt":
+        return v
+    if u == "in":
+        return v * 72.0
+    if u == "cm":
+        return v * 72.0 / 2.54
+    if u == "mm":
+        return v * 72.0 / 25.4
+    if u == "px":
+        return v * 0.75
+    return v
+
+
+def vml_size_pt(el) -> tuple[float, float] | None:
+    """从 VML v:shape / v:rect 的 style 属性读尺寸（如 width:96.4pt;height:85.15pt）。"""
+    cur = el
+    for _ in range(4):
+        if cur is None:
+            break
+        st = cur.get("style") or ""
+        if "width" in st and "height" in st:
+            w = h = None
+            for part in st.split(";"):
+                k, _, v = part.partition(":")
+                k = k.strip().lower()
+                if k == "width":
+                    w = _parse_css_pt(v)
+                elif k == "height":
+                    h = _parse_css_pt(v)
+            if w and h:
+                return w, h
+        cur = cur.getparent()
+    return None
+
+
 def image_size(p: Paragraph):
-    """插图的原始尺寸（磅）。读 wp:extent（EMU，1 磅 = 12700 EMU）。
+    """插图的原始尺寸（磅）。先读 DrawingML wp:extent（EMU），再兜底 VML style。
 
     有了原始尺寸，预览就能按 Word 里的真实大小显示，并且保留多倍像素，
     不会因为"像素数 = 磅数"在高 DPI 屏上被放大而发虚。
@@ -307,7 +388,11 @@ def image_size(p: Paragraph):
             try:
                 return int(cx) / 12700.0, int(cy) / 12700.0
             except ValueError:
-                return None
+                pass
+    for el in p._p.iter(VML + "imagedata"):
+        sz = vml_size_pt(el)
+        if sz:
+            return sz
     return None
 
 
@@ -366,6 +451,29 @@ def _math_text(p: Paragraph) -> str:
     return "".join(parts).strip()
 
 
+def _is_toc_field(p: Paragraph) -> bool:
+    """Word 自动目录生成的条目（内含 PAGEREF _Toc 域指令）。"""
+    for el in p._p.iter(qn("w:instrText")):
+        t = el.text or ""
+        if "PAGEREF" in t.upper() and "_TOC" in t.upper():
+            return True
+    return False
+
+
+def _left_indent_of(pPr, chain) -> float | None:
+    for el in [pPr, *[_style_pPr(st) for st in chain]]:
+        ind = _find_in_pPr(el, "ind")
+        if ind is None:
+            continue
+        v = _space_pt(ind, "left")
+        if v is not None:
+            return v
+        v = _space_pt(ind, "start")
+        if v is not None:
+            return v
+    return None
+
+
 def _in_table(p: Paragraph) -> bool:
     el = p._p.getparent()
     while el is not None:
@@ -394,8 +502,22 @@ RE_TOC = re.compile(r"^\s*(目\s*录|Contents)\b")
 
 def extract_features(doc: Document) -> list[ParaFeatures]:
     styles = list(doc.styles)
-    defaults = doc.element.find(".//" + qn("w:docDefaults"))
-    defaults_rpr = _rpr_of(defaults)
+    # docDefaults 在 styles.xml 里（不在 document.xml），层级是 docDefaults/rPrDefault/rPr。
+    # 以前写成 doc.element.find(...) 永远取到 None —— 样式派生格式的稿子会大面积读空。
+    defaults_rpr = None
+    defaults_pPr = None
+    try:
+        defaults = doc.styles.element.find(qn("w:docDefaults"))
+        if defaults is not None:
+            ppr_default = defaults.find(qn("w:pPrDefault"))
+            if ppr_default is not None:
+                defaults_pPr = ppr_default.find(qn("w:pPr"))
+            rpr_default = defaults.find(qn("w:rPrDefault"))
+            if rpr_default is not None:
+                defaults_rpr = rpr_default.find(qn("w:rPr"))
+    except Exception:      # noqa: BLE001
+        defaults_rpr = None
+        defaults_pPr = None
 
     cache: dict[int, list] = {}
     out: list[ParaFeatures] = []
@@ -417,15 +539,17 @@ def extract_features(doc: Document) -> list[ParaFeatures]:
             has_image=_has_image(p),
             has_math=_has_math(p),
             has_ole=_has_ole(p),
+            is_toc_field=_is_toc_field(p),
         )
 
         f.align = _align_of(pPr, chain)
         f.size_pt = _size_pt(p, pPr, chain, defaults_rpr)
-        f.bold = _bold_of(p, pPr, chain)
-        f.east_asia = _east_asia_of(p, pPr, chain)
-        f.ascii_font = _ascii_of(p, pPr, chain)
-        f.line_rule, f.line_value = _line_of(pPr, chain)
+        f.bold = _bold_of(p, pPr, chain, defaults_rpr)
+        f.east_asia = _east_asia_of(p, pPr, chain, defaults_rpr)
+        f.ascii_font = _ascii_of(p, pPr, chain, defaults_rpr)
+        f.line_rule, f.line_value = _line_of(pPr, chain, defaults_pPr)
         f.outline_level = _outline_of(pPr, chain)
+        f.left_indent_pt = _left_indent_of(pPr, chain)
 
         sp = _find_in_pPr(pPr, "spacing")
         if sp is not None:
@@ -482,3 +606,52 @@ def body_baseline(feats: list[ParaFeatures]) -> dict:
         "bold": bolds.most_common(1)[0][0] if bolds else False,
         "n": len(long_paras),
     }
+
+
+_DOC_CACHE: dict[tuple[str, float], str] = {}
+
+
+def ensure_docx(path) -> "Path":
+    """若是 .docx 原样返回；若是旧版 .doc，用本机 Word 静默另存为临时 .docx。"""
+    from pathlib import Path
+
+    p = Path(path)
+    if p.suffix.lower() == ".docx":
+        return p
+    if p.suffix.lower() != ".doc":
+        raise ValueError("只支持 .docx 或 .doc 格式的 Word 文档。")
+
+    key = (str(p.resolve()), p.stat().st_mtime)
+    hit = _DOC_CACHE.get(key)
+    if hit and Path(hit).exists():
+        return Path(hit)
+
+    import tempfile
+    try:
+        import win32com.client
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "无法自动转换 .doc（缺少 pywin32/Word），请先在 Word 中另存为 .docx 再打开。"
+        ) from exc
+
+    tmp_dir = Path(tempfile.gettempdir()) / "thesis_doc_conv"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    out = tmp_dir / f"{p.stem}_{abs(hash(key)) & 0xFFFF:04x}.docx"
+    if out.exists():
+        out.unlink()
+
+    word = win32com.client.DispatchEx("Word.Application")
+    word.Visible = False
+    word.DisplayAlerts = 0
+    try:
+        doc = word.Documents.Open(str(p.resolve()), ReadOnly=True, AddToRecentFiles=False)
+        try:
+            doc.SaveAs2(str(out.resolve()), FileFormat=16)  # wdFormatXMLDocument
+        finally:
+            doc.Close(False)
+    finally:
+        word.Quit()
+
+    _DOC_CACHE[key] = str(out)
+    return out
+

@@ -18,6 +18,8 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
+# 隔离 APPDATA：避免受用户本地“上次方案”影响，也绝不把测试方案写进用户目录
+os.environ["APPDATA"] = tempfile.mkdtemp(prefix="selftest_appdata_")
 
 from PySide6.QtCore import Qt, QSizeF, QCoreApplication, QMimeData, QUrl, QPointF
 from PySide6.QtGui import QTextCursor, QTextDocument, QDropEvent
@@ -101,12 +103,16 @@ def main() -> int:
     win.show()
     app.processEvents()
 
-    # ---- 顶栏按钮是否都在窗口内 ----
+    # ---- 顶栏按钮是否都在窗口内，且 split 按钮两半等高 ----
     for b in (win.open_btn, win.detect_btn, win.compare_btn, win.apply_btn):
         r = b.geometry()
         check(f"顶栏可见 {b.text()}",
               r.left() >= 0 and r.right() <= win.width() and r.width() > 20,
               f"[{r.left()},{r.right()}] w={r.width()}")
+    check("识别 split 按钮等高",
+          win.detect_btn.height() == win.detect_arrow.height(),
+          f"{win.detect_btn.height()} vs {win.detect_arrow.height()}")
+    check("标题编号默认关闭", not win.settings.enable_number_heading, "")
 
     # ---- 走真实 open_file() ----
     from docx import Document
@@ -438,9 +444,10 @@ def main() -> int:
     check("中文槽位=中文字体", bool(_east) and all(e != "Times New Roman" for e in _east),
           f"{sorted(set(_east))}")
 
-    # 标题编号分隔符可自定义
+    # 标题编号分隔符可自定义（这里要的是"全部替换"模式，否则已有编号会被保留）
     hs = Settings()
     hs.heading_sep = "-"
+    hs.number_keep_existing = False
     hp = [p.text for p in _phn(an2.detections, body, hs) if "." in p.text or "-" in p.text]
     check("标题编号分隔符可改", bool(hp) and all("." not in t for t in hp),
           str(hp[:3]))
@@ -483,6 +490,16 @@ def main() -> int:
     else:
         print("SKIP 图号可自定义（本文没有图注）")
     from detect.numbering import plan_heading_numbers as _phn
+
+    def _plans_now():
+        return {p.index: p.text
+                for p in _phn(an2.detections, body, win.settings)}
+
+    def _eff(idx, plans):
+        """这段最终的编号：有 plan 用 plan，否则保留原稿已有的编号。"""
+        return plans.get(idx) or (an2.detections[idx].number or "")
+
+    _plans0 = _plans_now()
     bad = [p.text for p in _phn(an2.detections, body, win.settings)
            if p.text.startswith("0.") or p.text.startswith("0 ")]
     check("标题编号不出现 0.x", not bad, str(bad[:3]))
@@ -511,8 +528,14 @@ def main() -> int:
             if f.text.strip().lower() in ("references", "参考文献", "致谢", "附录")
             and effective_role(an2.detections[i]).startswith("heading")]
     check("尾注区不占章号", not refh, str(refh[:4]))
-    hp = [p.text for p in _phn(an2.detections, body, win.settings)]
-    check("引言是第 1 章", bool(hp) and hp[0].startswith("1"), str(hp[:2]))
+    first_h = next((d.index for d in an2.detections
+                    if d.index >= (body or 0)
+                    and effective_role(d).startswith("heading")), None)
+    if first_h is not None:
+        eff = _eff(first_h, _plans0)
+        check("引言是第 1 章", eff.startswith("1"), repr(eff))
+    else:
+        print("SKIP 引言是第 1 章（没找到正文标题）")
 
     # 页号换算必须用 floor：round 会让每一页下半部分的点击落到下一页
     v = win.after_view
@@ -524,25 +547,48 @@ def main() -> int:
         mid = v.y_for_page(1) + int(v._paper[1] * v._zoom * 0.8)
         check("下半页仍算同一页", v.page_for_y(mid) == 1, f"y={mid}")
 
-    # 手动把某段改成别的角色后，编号要立即重算
+    # 编号模式：默认「保留原稿已有编号，只补缺的」；可切成「全部替换」
     h1s = [i for i, d in enumerate(win.analysis.detections)
            if (body or 0) < i and (
                d.role == "heading1" or effective_role(d) == "heading1")]
     if len(h1s) >= 2:
-        before = {p.index: p.text
-                  for p in _phn(win.analysis.detections, body, win.settings)}
+        keep = bool(getattr(win.settings, "number_keep_existing", True))
+        check("编号默认保留原稿已有编号", keep, str(keep))
+
+        def _plans():
+            return {p.index: p.text
+                    for p in _phn(win.analysis.detections, body, win.settings)}
+
+        # 已有编号的段落：保留模式下不该被改
         t = h1s[1]
+        has_num = bool(win.analysis.detections[t].number)
+        before = _plans()
         win._apply_role_to_para(t, "heading2")
-        after = {p.index: p.text
-                 for p in _phn(win.analysis.detections, body, win.settings)}
-        check("手动改层级后编号重算",
-              t in after and after[t] != before.get(t),
-              f"{before.get(t)!r} -> {after.get(t)!r}")
-        check("第一个标题仍是 1", after.get(body, "").startswith("1"),
-              repr(after.get(body)))
+        after = _plans()
+        if has_num:
+            check("保留模式：已有编号不动",
+                  after.get(t, before.get(t)) == before.get(t),
+                  f"{before.get(t)!r} -> {after.get(t)!r}")
+        else:
+            check("保留模式：缺编号的补上", t in after, str(after.get(t)))
         win._override_clear(t)
+
+        # 切成替换模式：同一处必须有新号
+        win.settings.number_keep_existing = False
+        b2 = _plans()
+        win._apply_role_to_para(t, "heading1")
+        a2 = _plans()
+        check("替换模式：编号被重排",
+              t in a2 and a2[t] != b2.get(t),
+              f"{b2.get(t)!r} -> {a2.get(t)!r}")
+        win.settings.number_keep_existing = True
+        win._override_clear(t)
+        # 第一个标题：保留模式用原稿已有的号，替换模式用新计划的号
+        _p = _plans_now()
+        eff = _eff(body, _p) if body is not None else ""
+        check("第一个标题仍是 1", eff.startswith("1"), repr(eff))
     else:
-        print("SKIP 手动改层级后编号重算（本文一级标题不足 2 个）")
+        print("SKIP 编号保留/替换（本文一级标题不足 2 个）")
 
     d3 = Document(str(out))
     dg = diagnose(d3)
@@ -754,6 +800,140 @@ def main() -> int:
     win.save("as")
     check("取消另存为不报错", True, "")
     QMessageBox.information = lambda *a, **k: None
+
+    # ---- 格式方案库：内置两套 + 增删 + 套用 ----
+    from detect import schemes
+
+    sc = schemes.Scheme(name="自测方案", kind="journal",
+                        settings=win.settings.scheme_payload(),
+                        source="selftest")
+    schemes.save(sc)
+    check("方案保存并能在列表中找到",
+          schemes.find("自测方案", "journal") is not None,
+          str([s.name for s in schemes.load_user_schemes()]))
+    check("内置方案只读",
+          schemes.builtin("journal").builtin
+          and not schemes.delete(schemes.builtin("journal")), "")
+    check("默认两套方案都在",
+          bool(schemes.builtin("journal").name and schemes.builtin("thesis").name),
+          "")
+    win._apply_scheme(schemes.find("自测方案", "journal"))
+    check("套用方案后状态栏跟着变", "自测方案" in win.scheme_btn.text(),
+          win.scheme_btn.text())
+    win._apply_scheme(schemes.builtin("journal"))
+    schemes.delete(sc)
+    check("方案删除后找不到", schemes.find("自测方案", "journal") is None, "")
+
+    # ---- 格式识别：样式/默认值派生的格式能读出来 ----
+    from detect.ui.scheme_dialogs import DetectDialog
+
+    dlg = DetectDialog(win.doc, win.analysis, base_settings=win.settings, parent=win)
+    dlg._detect()
+    check("识别核对表有内容", dlg.table.rowCount() > 0, f"{dlg.table.rowCount()} 行")
+    sizes = [f.size_pt for f in win.analysis.features]
+    check("字号没有读空的段落（docDefaults 修复）",
+          all(s is not None for s in sizes),
+          f"{sum(1 for s in sizes if s is None)} 段为空")
+    dlg.close()
+
+    # ---- 本轮回归：手动加粗不乱行距 / 三线表两粗一细 / 网格表预览有线 / 手动保存方案 ----
+    from PySide6.QtCore import QRectF as _QRF
+    from PySide6.QtGui import QColor as _QC, QImage as _QI, QPainter as _QP
+    from detect.ui.dialogs import ParaFormatDialog
+    from detect.ui.scheme_dialogs import SaveSchemeDialog
+    from detect.reflow import style_tables as _stbl
+
+    pdlg = ParaFormatDialog(0, {"font": "宋体", "ascii": "Times New Roman",
+                                "size": 12.0, "bold": False,
+                                "line": 1.5, "line_rule": "multiple",
+                                "align": "both", "color": ""}, win)
+    pdlg.set_value({"font": "宋体", "ascii": "Times New Roman",
+                    "size": 12.0, "bold": False,
+                    "line": 1.5, "line_rule": "multiple",
+                    "align": "both", "color": ""})
+    pdlg.bold.setChecked(True)
+    pv = pdlg.value()
+    check("手动加粗保持原行距方式（不坍成 1.5 磅固定值）",
+          pv["bold"] is True and pv["line_rule"] == "multiple", str(pv))
+    pdlg.close()
+
+    tdoc = Document()
+    tdoc.add_paragraph("表1 自测表")
+    tb0 = tdoc.add_table(rows=3, cols=3)
+    for r in range(3):
+        for c in range(3):
+            tb0.cell(r, c).text = f"R{r}C{c}"
+    ts = Settings()
+    _stbl(tdoc, ts)
+    tbl_b = tdoc.tables[0]._tbl.tblPr.find(_qn("w:tblBorders"))
+    tc_b = tdoc.tables[0].rows[0].cells[0]._tc.find(_qn("w:tcPr")).find(_qn("w:tcBorders")).find(_qn("w:bottom"))
+    check("三线表两粗一细（Word 顶/底 1.5 磅=12，栏目线 0.75 磅=6）",
+          tbl_b.find(_qn("w:top")).get(_qn("w:sz")) == "12"
+          and tbl_b.find(_qn("w:bottom")).get(_qn("w:sz")) == "12"
+          and tc_b.get(_qn("w:sz")) == "6",
+          f"top={tbl_b.find(_qn('w:top')).get(_qn('w:sz'))} head={tc_b.get(_qn('w:sz'))}")
+
+    tan = analyze(tdoc)
+    for st_name in ("three_line", "grid"):
+        ts.table_style = st_name
+        td_tbl, _ = render_side(tdoc, tan, ts, "after", (415.0, 680.0))
+        im_tbl = _QI(415, 200, _QI.Format.Format_ARGB32)
+        im_tbl.fill(_QC("#ffffff"))
+        pt_tbl = _QP(im_tbl)
+        pt_tbl.setRenderHint(_QP.RenderHint.SmoothPixmapTransform, True)
+        td_tbl.drawContents(pt_tbl, _QRF(0, 0, 415, 200))
+        pt_tbl.end()
+        hlines = 0
+        in_l = False
+        for y in range(im_tbl.height()):
+            dark = sum(1 for x in range(im_tbl.width())
+                       if im_tbl.pixelColor(x, y).lightness() < 235)
+            if dark > im_tbl.width() * 0.5:
+                if not in_l:
+                    hlines += 1
+                    in_l = True
+            else:
+                in_l = False
+        check(f"表格预览有线（{st_name}）", hlines >= 3, f"{hlines} 条横线")
+
+    sdlg = SaveSchemeDialog(schemes.builtin("journal"), win.settings, win)
+    sdlg.name_edit.setText("手动保存自测方案")
+    sdlg.kind_cb.setCurrentIndex(sdlg.kind_cb.findData("thesis"))
+    sdlg._save()
+    check("手动设置可直接存进学位论文方案",
+          sdlg.scheme is not None
+          and sdlg.scheme.kind == "thesis"
+          and sdlg.scheme.settings.get("profile") == "thesis"
+          and schemes.find("手动保存自测方案", "thesis") is not None,
+          f"{sdlg.scheme.kind if sdlg.scheme else None}")
+    if sdlg.scheme is not None:
+        check("方案可在学位/期刊之间移动",
+              schemes.move_kind(sdlg.scheme, "journal")
+              and schemes.find("手动保存自测方案", "journal") is not None
+              and schemes.find("手动保存自测方案", "thesis") is None, "")
+        schemes.delete(sdlg.scheme)
+    sdlg.close()
+
+    # 格式识别弹窗：来源单选与类型单选互不干扰，且能保存到学位论文
+    ddlg = DetectDialog(win.doc, win.analysis, base_settings=win.settings, parent=win)
+    ddlg.kind_thesis.setChecked(True)
+    ddlg.tpl_radio.setChecked(True)
+    check("格式识别：选模板来源不会把「学位」单选框取消",
+          ddlg.kind_thesis.isChecked() and ddlg.tpl_radio.isChecked(),
+          f"thesis={ddlg.kind_thesis.isChecked()} tpl={ddlg.tpl_radio.isChecked()}")
+    ddlg.cur_radio.setChecked(True)
+    ddlg._detect()
+    ddlg.name_edit.setText("识别学位自测")
+    ddlg._save_scheme()
+    check("格式识别：可正常保存到学位论文",
+          ddlg.scheme is not None
+          and ddlg.scheme.kind == "thesis"
+          and ddlg.scheme.settings.get("profile") == "thesis"
+          and schemes.find("识别学位自测", "thesis") is not None,
+          f"{ddlg.scheme.kind if ddlg.scheme else None}")
+    if ddlg.scheme is not None:
+        schemes.delete(ddlg.scheme)
+    ddlg.close()
 
     print("\n" + ("全部通过" if not FAIL else f"失败 {len(FAIL)} 项: {FAIL}"))
     win.close()

@@ -34,6 +34,34 @@ RE_CAP_EN = re.compile(r"^\s*(Fig(?:ure)?|Table)\b", re.I)
 RE_HEAD_LABEL = re.compile(
     r"^\s*(?:\d+(?:\s*\.\s*\d+)*\s*[.、．]?|[一二三四五六七八九十百]+、)\s+"
 )
+# 从已有编号里取层级数字（1.2 → [1, 2]）
+RE_NUM_PARTS = re.compile(r"^(\d+(?:\.\d+)*)")
+# 已有图号/表号：图3.2 / 图 3.2 / Fig. 3.2 / Table 3-2
+RE_CAP_NUM = re.compile(
+    r"^\s*(?:图|表|Figure|Fig\.?|Table)\s*(\d+)(?:\s*[.\-–—]\s*(\d+))?",
+    re.I,
+)
+
+
+def _heading_parts(number_text) -> list[int] | None:
+    """把已有标题编号解析成层级数字；解析不了返回 None。"""
+    if not number_text:
+        return None
+    m = RE_NUM_PARTS.match(number_text.strip())
+    if not m:
+        return None
+    try:
+        return [int(p) for p in m.group(1).split(".")]
+    except ValueError:
+        return None
+
+
+def _caption_parts(text) -> tuple[int, int | None] | None:
+    """把已有图号/表号解析成 (N, M?)；解析不了返回 None。"""
+    m = RE_CAP_NUM.match((text or "").strip())
+    if not m:
+        return None
+    return int(m.group(1)), (int(m.group(2)) if m.group(2) else None)
 
 
 def _strip_leading(text: str, rx: re.Pattern, limit: int = 3) -> str:
@@ -116,11 +144,10 @@ def _has_number(d: Detection) -> bool:
 def plan_heading_numbers(detections: list[Detection],
                          body_index: int | None = None,
                          settings=None) -> list[NumberPlan]:
-    """按层级生成标题编号（全部重排）。
+    """按层级生成标题编号。
 
-    不能"只补缺的"：只要有一部分标题带编号，跳过它们会让计数器错位
-    （实测：跳过已有的 7.2 后，前面的 2 级标题被编成 2.1、2.2……）。
-    所以统一重排，并在预览里明确标出哪些已有编号会被覆盖。
+    `number_keep_existing`（默认开）时**保留原稿已有的编号**：读到已有编号
+    就把计数器对齐到它，只给缺编号的段落补号；关掉则全部重排。
 
     body_index 之后才开始编号：封面/前置部分（摘要、Highlights 之类）
     不参与章号，否则会出现 "0.1 Highlights" 这种章号为 0 的编号。
@@ -131,6 +158,8 @@ def plan_heading_numbers(detections: list[Detection],
     sep = getattr(settings, "heading_sep", ".") if settings is not None else "."
     if sep is None:
         sep = ""
+    keep = bool(getattr(settings, "number_keep_existing", True)) \
+        if settings is not None else True
     plans: list[NumberPlan] = []
     for d in detections:
         role = effective_role(d)
@@ -143,6 +172,13 @@ def plan_heading_numbers(detections: list[Detection],
         # 否则会编出 "0.1" 这种章号为 0 的号（实测期刊稿会踩到）
         if lvl > 1 and counters[1] == 0:
             lvl = 1
+        if keep:
+            parts = _heading_parts(d.number)
+            if parts:
+                # 原稿写了编号：原样保留，计数器对齐到它，后面接着编
+                for i in range(1, 4):
+                    counters[i] = parts[i - 1] if i <= len(parts) else 0
+                continue
         counters[lvl] += 1
         for deeper in range(lvl + 1, 4):
             counters[deeper] = 0
@@ -159,6 +195,9 @@ def plan_caption_numbers(detections: list[Detection], kind: str,
     前缀文字、分隔符（. / - / 空）、是否按章、起始号。
     设置 caption_prefix_auto（默认开）时，原稿图注普遍用 Fig./Table 开头
     就沿用英文前缀，避免「图1.1 Fig. 1 …」这种重复。
+
+    `number_keep_existing`（默认开）时，原稿已有的图号/表号原样保留，
+    计数器对齐到它，只给缺编号的图注补号。
     """
     default = ((getattr(settings, "caption_fig_prefix", "图") or "图")
                if kind == "figure"
@@ -171,6 +210,8 @@ def plan_caption_numbers(detections: list[Detection], kind: str,
     sep = getattr(settings, "caption_sep", ".") or ""
     by_chapter = getattr(settings, "caption_by_chapter", True)
     start = int(getattr(settings, "caption_start", 1) or 1)
+    keep = bool(getattr(settings, "number_keep_existing", True)) \
+        if settings is not None else True
     chapter = 0
     per_chapter = start - 1
     plans: list[NumberPlan] = []
@@ -182,6 +223,19 @@ def plan_caption_numbers(detections: list[Detection], kind: str,
             continue
         if role != ("figure_caption" if kind == "figure" else "table_caption"):
             continue
+        if keep:
+            txt = feats[d.index].text if feats is not None else (d.number or "")
+            got = _caption_parts(txt)
+            if got is not None:
+                n, m = got
+                if by_chapter:
+                    if m is not None:
+                        chapter, per_chapter = n, m
+                    else:
+                        per_chapter = n
+                else:
+                    per_chapter = n
+                continue
         per_chapter += 1
         n = chapter if by_chapter else max(1, chapter)
         # 中文前缀"图1.1"不加空格；英文前缀 "Fig. 1.1" / "Figure 1.1" 加空格

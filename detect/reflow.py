@@ -304,9 +304,10 @@ def _apply_table_position(doc, settings) -> int:
 
 
 def style_tables(doc, settings) -> int:
-    """表格样式：三线表（顶线+表头线+底线）/ 网格 / 无线；并统一表内字体。"""
+    """表格样式：三线表（两粗一细：顶/底线粗、栏目线细）/ 网格 / 无线；并统一表内字体。"""
     style = getattr(settings, "table_style", "three_line")
-    width = float(getattr(settings, "table_line", 1.0) or 0)
+    outer = float(getattr(settings, "table_line", 1.5) or 0)
+    inner = float(getattr(settings, "table_line_inner", 0.75) or 0)
     _apply_table_fonts(doc, settings)
     _apply_table_position(doc, settings)
     n = 0
@@ -314,14 +315,12 @@ def style_tables(doc, settings) -> int:
         tblPr = table._tbl.tblPr
         _remove(tblPr, "tblBorders")
         borders = OxmlElement("w:tblBorders")
+        sides = ("top", "bottom", "left", "right", "insideH", "insideV")
         if style == "grid":
-            sides = ("top", "bottom", "left", "right", "insideH", "insideV")
             vals = {k: "single" for k in sides}
         elif style == "none":
-            sides = ("top", "bottom", "left", "right", "insideH", "insideV")
             vals = {k: "none" for k in sides}
         else:   # three_line
-            sides = ("top", "bottom", "left", "right", "insideH", "insideV")
             vals = {"top": "single", "bottom": "single",
                     "left": "none", "right": "none",
                     "insideH": "none", "insideV": "none"}
@@ -329,21 +328,29 @@ def style_tables(doc, settings) -> int:
             val = vals[side]
             el = OxmlElement("w:" + side)
             el.set(qn("w:val"), val)
-            if val == "single" and width > 0:
-                el.set(qn("w:sz"), str(max(1, int(round(width * 8)))))
+            w_pt = inner if (style == "grid" and side in ("insideH", "insideV") and inner > 0) else outer
+            if val == "single" and w_pt > 0:
+                el.set(qn("w:sz"), str(max(1, int(round(w_pt * 8)))))
                 el.set(qn("w:color"), "000000")
             borders.append(el)
         tblPr.append(borders)
 
-        # 三线表的表头线：第一行每个单元格加下边框
-        if style == "three_line" and width > 0:
+        # 清掉旧单元格边框，避免原网格线在三线表/无线表里残留
+        for row in table.rows:
+            for cell in row.cells:
+                tcPr = cell._tc.find(qn("w:tcPr"))
+                if tcPr is not None:
+                    _remove(tcPr, "tcBorders")
+
+        # 三线表的栏目线（表头下线）：用较细的 inner（默认 0.75 磅）
+        head_w = inner if inner > 0 else outer
+        if style == "three_line" and head_w > 0 and table.rows:
             for cell in table.rows[0].cells:
                 tcPr = cell._tc.get_or_add_tcPr()
-                _remove(tcPr, "tcBorders")
                 tb = OxmlElement("w:tcBorders")
                 el = OxmlElement("w:bottom")
                 el.set(qn("w:val"), "single")
-                el.set(qn("w:sz"), str(max(1, int(round(width * 8)))))
+                el.set(qn("w:sz"), str(max(1, int(round(head_w * 8)))))
                 el.set(qn("w:color"), "000000")
                 tb.append(el)
                 tcPr.append(tb)

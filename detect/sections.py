@@ -145,27 +145,46 @@ def insert_break_before(paragraph):
     return sectPr
 
 
-def split_document(doc, front_index: int, body_index: int) -> list:
-    """在 front_index（前置起点）与 body_index（正文起点）处切分。
+def _section_para_ranges(doc) -> list[tuple[int, int]]:
+    """返回每一节覆盖的段落区间 [start, end]（包含端点）。"""
+    ends = []
+    for i, p in enumerate(doc.paragraphs):
+        pPr = p._p.find(qn("w:pPr"))
+        if pPr is not None and pPr.find(qn("w:sectPr")) is not None:
+            ends.append(i)
+    ends.append(max(0, len(doc.paragraphs) - 1))
+    ranges = []
+    start = 0
+    for end in ends:
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
 
-    返回三节的列表 [封面, 前置, 正文]。
-    若文档已经是 3 节，则不再切分，直接返回（只配置）。
+
+def _starts_of_sections(doc) -> set[int]:
+    return {s for s, _ in _section_para_ranges(doc)}
+
+
+def split_document(doc, front_index: int, body_index: int) -> list:
+    """确保文档至少分出封面 / 前置 / 正文三节。
+
+    若原稿已有 ≥ 3 节（如 3 节学位论文、含横向表格页的 7 节 / 15 节报告），
+    保留原稿全部分节不插入多余分节符，交由 configure() 按段落位置映射各分区。
     """
     if not (0 < front_index < body_index < len(doc.paragraphs)):
         raise ValueError(f"切分点非法：front={front_index} body={body_index} n={len(doc.paragraphs)}")
 
-    existing = len(doc.sections)
-    if existing >= 3:
+    if len(doc.sections) >= 3:
         return list(doc.sections)
 
+    starts = _starts_of_sections(doc)
     # 先切后面的，避免插入元素导致前面的索引漂移
-    insert_break_before(doc.paragraphs[body_index])
-    insert_break_before(doc.paragraphs[front_index])
+    if body_index not in starts:
+        insert_break_before(doc.paragraphs[body_index])
+    if front_index not in starts:
+        insert_break_before(doc.paragraphs[front_index])
 
-    sections = list(doc.sections)
-    if len(sections) != 3:
-        raise RuntimeError(f"切分后应为 3 节，实际 {len(sections)} 节")
-    return sections
+    return list(doc.sections)
 
 
 # ------------------------------------------------------------------ #
@@ -217,16 +236,64 @@ def _apply_header(doc, settings) -> None:
         _set_header_line(p, width, color, style, gap)
 
 
+def _clone_cont(plan: SectionPlan) -> SectionPlan:
+    """同一分区内的后续节（如横向表格页）：沿用页眉/页码格式，但不重置起始页码。"""
+    return SectionPlan(
+        header_text=plan.header_text,
+        footer_page=plan.footer_page,
+        number_format=plan.number_format,
+        number_start=None,
+        link_to_previous=plan.link_to_previous,
+    )
+
+
+def _expand_plans(doc, plans: list[SectionPlan],
+                  front_index: int | None, body_index: int | None) -> list[SectionPlan]:
+    sections = list(doc.sections)
+    n = len(sections)
+    if len(plans) == n:
+        return plans
+    if len(plans) == 1:
+        return [plans[0]] + [_clone_cont(plans[0]) for _ in range(n - 1)]
+    if len(plans) == 3 and n >= 1:
+        ranges = _section_para_ranges(doc)
+        if len(ranges) != n:
+            # 退化：首节封面、次节前置、其余正文
+            out = []
+            for idx in range(n):
+                if idx == 0:
+                    out.append(plans[0])
+                elif idx == 1:
+                    out.append(plans[1])
+                elif idx == 2:
+                    out.append(plans[2])
+                else:
+                    out.append(_clone_cont(plans[2]))
+            return out
+        out = []
+        seen_front = False
+        seen_body = False
+        for _, end_p in ranges:
+            if front_index is not None and end_p < front_index:
+                out.append(plans[0])
+            elif body_index is not None and end_p < body_index:
+                out.append(plans[1] if not seen_front else _clone_cont(plans[1]))
+                seen_front = True
+            else:
+                out.append(plans[2] if not seen_body else _clone_cont(plans[2]))
+                seen_body = True
+        return out
+    raise ValueError(f"节数 {n} 与计划数 {len(plans)} 不符")
+
+
 def configure(doc, plans: list[SectionPlan] | None = None,
-              settings=None) -> list:
-    """按 plans 配置每一节。"""
+              settings=None,
+              front_index: int | None = None,
+              body_index: int | None = None) -> list:
+    """按 plans 配置每一节（自动适配原稿多于 3 节的场景，如含横向页面）。"""
     plans = plans or PLAN_THESIS
     sections = list(doc.sections)
-    if len(plans) == 1 and len(sections) > 1:
-        # 期刊论文只有一节计划，但原文可能已经有若干节 → 全部套用同一计划
-        plans = plans * len(sections)
-    if len(sections) != len(plans):
-        raise ValueError(f"节数 {len(sections)} 与计划数 {len(plans)} 不符")
+    plans = _expand_plans(doc, plans, front_index, body_index)
 
     for i, (section, plan) in enumerate(zip(sections, plans)):
         # 页眉
@@ -286,7 +353,8 @@ def apply(doc, front_index: int, body_index: int,
           settings=None) -> list:
     """切分 + 配置。会改动文档结构，调用前请先备份。"""
     split_document(doc, front_index, body_index)
-    return configure(doc, plans, settings)
+    return configure(doc, plans, settings,
+                     front_index=front_index, body_index=body_index)
 
 
 def diagnose(doc) -> dict:

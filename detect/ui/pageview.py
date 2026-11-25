@@ -35,6 +35,7 @@ class PageView(QWidget):
         self._fit_mode = "window"       # window 适应窗口 / page 适应整页 / pct 固定比例
         self._zoom_pct = 100
         self._sel_block = None
+        self._sel_srcs: set = set()      # Ctrl 多选的原稿段号（批量改格式用）
         self._header_line = 0.0
         self._header_line_style = "single"
         self._header_line_color = QColor("#000000")
@@ -90,6 +91,7 @@ class PageView(QWidget):
         self._show_pagenum = show_pagenum
         self._src_of_block = src_of_block or {}
         self._sel_block = None
+        self._sel_srcs = set()
         if page_count is None:
             page_count = doc.pageCount() if doc is not None else 1
         self._pages = max(1, page_count)
@@ -107,6 +109,57 @@ class PageView(QWidget):
     def set_selected_block(self, block) -> None:
         self._sel_block = block
         self.update()
+
+    # ---- Ctrl 多选（批量改格式）----
+    def selected_srcs(self) -> set:
+        return set(self._sel_srcs)
+
+    def set_selected_srcs(self, srcs) -> None:
+        self._sel_srcs = set(srcs or ())
+        self.update()
+
+    def clear_selection(self) -> None:
+        self._sel_srcs = set()
+        self.update()
+
+    def block_for_src(self, src: int):
+        """原稿段号 → QTextBlock（用于画选中高亮）。"""
+        for pos, s in (self._src_of_block or {}).items():
+            if s == src:
+                return self._doc.findBlock(pos)
+        return None
+
+    def _highlight(self, p: QPainter, i: int, cx: float, cy: float, cw: float,
+                   ch: float, z: float, color: QColor,
+                   only_block=None, srcs=None) -> None:
+        """把某一页里需要高亮的段落矩形涂出来（画在文字下面）。"""
+        if srcs:
+            blocks = []
+            for s in srcs:
+                b = self.block_for_src(s)
+                if b is not None and b.isValid():
+                    blocks.append(b)
+        elif only_block is not None:
+            blocks = [only_block]
+        else:
+            return
+        for b in blocks:
+            try:
+                br = self._doc.documentLayout().blockBoundingRect(b)
+            except Exception:
+                continue
+            if br.height() <= 0:
+                continue
+            top = br.y() - i * self._content_h
+            if top + br.height() <= 0 or top >= self._content_h:
+                continue
+            p.save()
+            p.setClipRect(QRectF(cx, cy, cw, ch))
+            p.translate(cx, cy)
+            p.scale(z, z)
+            p.translate(0, -i * self._content_h)
+            p.fillRect(QRectF(br.x(), br.y(), br.width(), br.height()), color)
+            p.restore()
 
     def zoom_percent(self) -> int:
         return int(round(self._zoom * 100))
@@ -193,6 +246,17 @@ class PageView(QWidget):
         src = self._src_of_block.get(block.position())
         if src is None:
             return
+        # Ctrl+点击 = 多选（批量改格式）；不加 Ctrl 才是"点某一段看格式"
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if src in self._sel_srcs:
+                self._sel_srcs.discard(src)
+            else:
+                self._sel_srcs.add(src)
+            self._sel_block = block if self._sel_srcs else None
+            self.update()
+            if getattr(self, "on_selection_changed", None):
+                self.on_selection_changed()
+            return
         fn(src, self.mapToGlobal(event.pos()), block)
 
     # ---------------------------------------------------------------- #
@@ -212,6 +276,7 @@ class PageView(QWidget):
     # ---------------------------------------------------------------- #
     def paintEvent(self, event) -> None:
         p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         p.fillRect(event.rect(), QColor("#ececf0"))
         if self._doc is None:
             p.setPen(QColor("#86868b"))
@@ -241,23 +306,13 @@ class PageView(QWidget):
 
             cx, cy = page.x() + l, page.y() + t
 
-            # 选中段落的高亮（画在文字下面）
-            if self._sel_block is not None and self._doc is not None:
-                try:
-                    br = self._doc.documentLayout().blockBoundingRect(self._sel_block)
-                except Exception:
-                    br = None
-                if br is not None and br.height() > 0:
-                    top = br.y() - i * self._content_h
-                    if top + br.height() > 0 and top < self._content_h:
-                        p.save()
-                        p.setClipRect(QRectF(cx, cy, cw, ch))
-                        p.translate(cx, cy)
-                        p.scale(z, z)
-                        p.translate(0, -i * self._content_h)
-                        p.fillRect(QRectF(br.x(), br.y(), br.width(), br.height()),
-                                   QColor(0, 122, 255, 34))
-                        p.restore()
+            # 选中段落的高亮（画在文字下面）：多选用深一点的蓝，单点用浅的
+            self._highlight(p, i, cx, cy, cw, ch, z,
+                            QColor(0, 122, 255, 64), srcs=self._sel_srcs)
+            if not self._sel_srcs and self._sel_block is not None:
+                self._highlight(p, i, cx, cy, cw, ch, z,
+                                QColor(0, 122, 255, 34),
+                                only_block=self._sel_block)
 
             p.save()
             p.setClipRect(QRectF(cx, cy, cw, ch))

@@ -90,22 +90,21 @@ class RoleDialog(_BaseDialog):
         self.bold.setChecked(bool(value.get("bold")))
         self.row("", self.bold)
 
-        self.line = QDoubleSpinBox()
-        self.line.setRange(1, 100)
-        self.line.setValue(float(value.get("line", 22)))
-        self.row("行距（磅，固定值）", self.line)
-
-        self.align = QComboBox()
         self.line_rule = QComboBox()
         for key, text in LINE_RULES:
             self.line_rule.addItem(text, key)
-        i = self.line_rule.findData(value.get("line_rule") or "exact")
+        rule0 = value.get("line_rule") or "exact"
+        i = self.line_rule.findData(rule0)
         self.line_rule.setCurrentIndex(i if i >= 0 else 0)
         self.row("行距方式", self.line_rule)
 
         self.line = QDoubleSpinBox()
         self.line.setRange(1, 100)
-        self.line.setValue(float(value.get("line", 22)))
+        lv0 = float(value.get("line", 22) or 22)
+        if rule0 in ("exact", "minimum") and lv0 < 6.0:
+            lv0 = max(18.0, round(float(value.get("size", 12)) * 1.5, 1))
+        self.line.setValue(lv0)
+        self.line.setEnabled(rule0 in ("exact", "minimum"))
         self.row("行距（磅）", self.line)
 
         self.color = QComboBox()
@@ -129,9 +128,20 @@ class RoleDialog(_BaseDialog):
 
         for w in (self.size, self.line):
             w.valueChanged.connect(lambda *_: self._refresh_preview())
-        for w in (self.font, self.latin, self.align, self.line_rule, self.color):
+        for w in (self.font, self.latin, self.align, self.color):
             w.currentIndexChanged.connect(lambda *_: self._refresh_preview())
+        self.line_rule.currentIndexChanged.connect(self._line_rule_changed)
         self.bold.toggled.connect(lambda *_: self._refresh_preview())
+        self._refresh_preview()
+
+    def _line_rule_changed(self) -> None:
+        rule = self.line_rule.currentData() or "exact"
+        need_pt = rule in ("exact", "minimum")
+        self.line.setEnabled(need_pt)
+        if need_pt and self.line.value() < 6.0:
+            self.line.blockSignals(True)
+            self.line.setValue(max(18.0, round(self.size.value() * 1.5, 1)))
+            self.line.blockSignals(False)
         self._refresh_preview()
 
     def _refresh_preview(self) -> None:
@@ -228,9 +238,10 @@ class NumberingDialog(_BaseDialog):
         "table": ("表号（表1.1，按章编排）", "enable_number_table"),
     }
     NOTES = {
-        "heading": "层级由识别决定；推断有误请先在「识别明细」里改正。",
-        "figure": "章号取一级标题。已有图号会被重新编排。",
-        "table": "章号取一级标题。已有表号会被重新编排。",
+        "heading": "层级由识别决定；推断有误请先在「识别明细」里改正。"
+                   "默认保留原稿已有的编号，只给缺编号的补号。",
+        "figure": "章号取一级标题。默认保留原稿已有的图号，只补缺的。",
+        "table": "章号取一级标题。默认保留原稿已有的表号，只补缺的。",
     }
     DEMOS = {
         "heading": [("1  一级标题", 0), ("1.1  二级标题", 1), ("1.1.1  三级标题", 2)],
@@ -245,6 +256,10 @@ class NumberingDialog(_BaseDialog):
         self.chk = MarkCheck(label)
         self.chk.setChecked(getattr(settings, attr))
         self.row("", self.chk)
+
+        self.keep = MarkCheck("保留原稿已有编号（只给缺编号的补号）")
+        self.keep.setChecked(bool(getattr(settings, "number_keep_existing", True)))
+        self.row("", self.keep)
 
         note = QLabel(self.NOTES[kind])
         note.setObjectName("card-note")
@@ -268,7 +283,11 @@ class NumberingDialog(_BaseDialog):
         self._refresh()
 
     def _refresh(self) -> None:
-        if not self.chk.isChecked():
+        on = self.chk.isChecked()
+        self.keep.setEnabled(on)
+        if self.kind == "heading":
+            self.sep.setEnabled(on)
+        if not on:
             items = [("（未启用）", 0)]
         elif self.kind == "heading":
             sep = self.sep.currentData() or ""
@@ -282,6 +301,7 @@ class NumberingDialog(_BaseDialog):
 
     def apply_to(self, settings) -> None:
         setattr(settings, self.CHECKS[self.kind][1], self.chk.isChecked())
+        settings.number_keep_existing = self.keep.isChecked()
         if self.kind == "heading":
             settings.heading_sep = self.sep.currentData() or ""
 
@@ -485,22 +505,27 @@ class IndentDialog(_BaseDialog):
 HELP_LINES = [
     "怎么用",
     "────────────",
-    "1. 打开 docx：双栏预览立刻生成，左=原稿、右=排版后。",
-    "2. 先选「论文类型」（右下角）：学位论文=三节+罗马/阿拉伯页码；",
-    "   期刊论文=单节+阿拉伯页码从 1 起。切换会换整套格式预设。",
+    "1. 打开文档：点左上角「打开文档」或直接把 .docx / .doc 拖进窗口，",
+    "   双栏预览立刻生成（左=原稿、右=排版后；.doc 会自动转 .docx）。",
+    "2. 选「格式方案」（右下角）：内置「期刊论文默认」和「学位论文默认」，",
+    "   学位论文=三节+罗马/阿拉伯页码，期刊论文=单节+阿拉伯页码从 1 起。",
     "3. 按角色设格式：顶部 Ribbon 每个按钮一张卡片，卡片里的",
-    "   「示意」会跟着设置实时变。",
-    "4. 摘要/关键词/目录/参考文献/公式都有独立卡片，可以单独设。",
-    "5. 想单独改某一段：在右栏点它，弹浮动条，可改字体/字号/",
-    "   行距/加粗/对齐/字色，也可以直接把它「设为」某个角色。",
-    "6. 一键排版：只生成结果并刷新预览，不落盘。",
-    "7. 保存：顶栏「保存 ▾」自己选覆盖原文件（自动备份 .bak.docx）",
+    "   「示意」会跟着设置实时变；三线表支持顶/底线（1.5 磅）与",
+    "   栏目线（0.75 磅）两粗一细独立调节。",
+    "4. 保存格式方案：调好参数后点右下角「格式方案 → 保存当前设置为方案…」，",
+    "   无需经过格式识别即可存为可复用方案，支持选「期刊论文」或「学位论文」。",
+    "5. 从模板学格式：点顶栏「从原稿识别 ▾」，可从当前文档或模板文件读取",
+    "   各角色格式，核对后直接保存为方案。",
+    "6. 单独/批量改段落：右栏单击某段弹浮动格式条（支持字体/字号/加粗/",
+    "   行距方式/行距/对齐/字色，或「设为」某个角色）；Ctrl+点击可多选批量改。",
+    "7. 一键排版：只生成结果并刷新预览，不落盘。",
+    "8. 保存：顶栏「保存 ▾」自己选覆盖原文件（自动备份 .bak.docx）",
     "   还是另存为。",
     "",
     "几个常用开关",
     "────────────",
     "· 同步：两栏一起滑动（左栏标题行右侧）。",
-    "· −/＋/适应窗口/适应整页：每栏单独缩放。",
+    "· −/＋/适应窗口/适应整页 / Ctrl+滚轮：每栏单独缩放。",
     "· 识别明细：逐段查看自动识别结果，可手工改正角色/层级。",
     "",
     "自动上下标",
@@ -512,7 +537,7 @@ HELP_LINES = [
     "────────────",
     "· 预览的分页位置按 Qt 的字体度量算，和 Word 不会完全一致。",
     "· 目录页码要在 Word 里按 F9 刷新（域缓存改不了）。",
-    "· MathType 公式以图片形态显示在预览里。",
+    "· Word 公式（OMML）与 MathType 公式在预览里以位图绘制，排版结果保留原公式可继续编辑。",
 ]
 
 
@@ -577,7 +602,8 @@ ROLE_CHOICES = [
     ("reference", "参考文献"),
     ("abstract", "摘要"),
     ("keywords", "关键词"),
-    ("toc", "目录"),
+    ("toc", "目录标题"),
+    ("toc_item", "目录条目"),
     ("meta", "封面信息"),
     ("other", "其他"),
 ]
@@ -601,8 +627,16 @@ class TableDialog(_BaseDialog):
         self.line = QDoubleSpinBox()
         self.line.setRange(0, 6)
         self.line.setSingleStep(0.25)
-        self.line.setValue(float(getattr(settings, "table_line", 1.0) or 0))
-        self.row("线宽（磅）", self.line)
+        self.line.setDecimals(2)
+        self.line.setValue(float(getattr(settings, "table_line", 1.5) or 0))
+        self.row("顶线/底线（外框）粗细（磅）", self.line)
+
+        self.line_inner = QDoubleSpinBox()
+        self.line_inner.setRange(0, 6)
+        self.line_inner.setSingleStep(0.25)
+        self.line_inner.setDecimals(2)
+        self.line_inner.setValue(float(getattr(settings, "table_line_inner", 0.75) or 0))
+        self.row("栏目线（内线）粗细（磅）", self.line_inner)
 
         self.font_size = QDoubleSpinBox()
         self.font_size.setRange(6, 20)
@@ -648,32 +682,39 @@ class TableDialog(_BaseDialog):
         self.pos.setCurrentIndex(i if i >= 0 else 0)
         self.row("表格位置", self.pos)
 
-        note = QLabel("三线表是中文期刊/学位论文的标准表式：只有顶线、表头线、底线。")
+        note = QLabel("三线表常用「两粗一细」：顶线/底线 1.5 磅，表头下方的栏目线 0.75 磅。")
         note.setObjectName("card-note")
         note.setWordWrap(True)
         self.row("", note)
 
-        self.demo = DemoWidget("caption_tab", self)
+        self.demo = DemoWidget("table", self)
         self.row("示意", self.demo)
-        for w in (self.font, self.latin, self.color):
+        for w in (self.style, self.font, self.latin, self.color):
             w.currentIndexChanged.connect(lambda *_: self._refresh())
-        self.font_size.valueChanged.connect(lambda *_: self._refresh())
+        for w in (self.line, self.line_inner, self.font_size):
+            w.valueChanged.connect(lambda *_: self._refresh())
         self.bold.toggled.connect(lambda *_: self._refresh())
         self.align.currentIndexChanged.connect(lambda *_: self._refresh())
         self.pos.currentIndexChanged.connect(lambda *_: self._refresh())
         self._refresh()
 
     def _refresh(self) -> None:
+        st = self.style.currentData() or "three_line"
+        self.line.setEnabled(st != "none")
+        self.line_inner.setEnabled(st != "none")
         self.demo.data = {
+            "style": st,
+            "outer": self.line.value(),
+            "inner": self.line_inner.value(),
             "size": self.font_size.value(),
             "bold": self.bold.isChecked(),
-            "text": "表1.1  表题示例",
         }
         self.demo.update()
 
     def apply_to(self, settings) -> None:
         settings.table_style = self.style.currentData()
         settings.table_line = self.line.value()
+        settings.table_line_inner = self.line_inner.value()
         settings.table_font_size = self.font_size.value()
         settings.table_font = self.font.currentText()
         settings.table_ascii = self.latin.currentText()
@@ -689,6 +730,11 @@ class CaptionNumberDialog(_BaseDialog):
     def __init__(self, settings, parent=None, kind: str = "figure"):
         self.kind = kind
         super().__init__("图号格式" if kind == "figure" else "表号格式", parent)
+        self._en_attr = "enable_number_figure" if kind == "figure" else "enable_number_table"
+        self.chk = MarkCheck("启用图号编排（图1.1）" if kind == "figure" else "启用表号编排（表1.1）")
+        self.chk.setChecked(bool(getattr(settings, self._en_attr, False)))
+        self.row("", self.chk)
+
         pfx = "caption_fig_prefix" if kind == "figure" else "caption_tab_prefix"
         self.prefix = QLineEdit(getattr(settings, pfx, "图" if kind == "figure" else "表"))
         self.row("前缀文字", self.prefix)
@@ -715,10 +761,13 @@ class CaptionNumberDialog(_BaseDialog):
         self.start.setValue(int(getattr(settings, "caption_start", 1) or 1))
         self.row("起始序号", self.start)
 
+        self.keep = MarkCheck("保留原稿已有编号（只给缺编号的补号）")
+        self.keep.setChecked(bool(getattr(settings, "number_keep_existing", True)))
+        self.row("", self.keep)
+
         self.demo = DemoWidget("number", self)
         self.row("示意", self.demo)
-        for w in (self.prefix, self.sep, self.start):
-            pass
+        self.chk.toggled.connect(lambda *_: self._refresh())
         self.prefix.textChanged.connect(lambda *_: self._refresh())
         self.auto_pfx.toggled.connect(lambda *_: self._refresh())
         self.sep.currentIndexChanged.connect(lambda *_: self._refresh())
@@ -727,24 +776,32 @@ class CaptionNumberDialog(_BaseDialog):
         self._refresh()
 
     def _refresh(self) -> None:
-        pfx = self.prefix.text() or "图"
-        sep = self.sep.currentData() or ""
-        self.prefix.setEnabled(not self.auto_pfx.isChecked())
-        if self.by_chapter.isChecked():
-            items = [(f"{pfx}1{sep}1  第 1 章第 1 图", 0),
-                     (f"{pfx}1{sep}2  第 1 章第 2 图", 0)]
+        on = self.chk.isChecked()
+        for w in (self.auto_pfx, self.sep, self.by_chapter, self.start, self.keep):
+            w.setEnabled(on)
+        self.prefix.setEnabled(on and not self.auto_pfx.isChecked())
+        if not on:
+            items = [("（未启用）", 0)]
         else:
-            items = [(f"{pfx}1  全文第 1 图", 0), (f"{pfx}2  全文第 2 图", 0)]
+            pfx = self.prefix.text() or ("图" if self.kind == "figure" else "表")
+            sep = self.sep.currentData() or ""
+            if self.by_chapter.isChecked():
+                items = [(f"{pfx}1{sep}1  第 1 章第 1 项", 0),
+                         (f"{pfx}1{sep}2  第 1 章第 2 项", 0)]
+            else:
+                items = [(f"{pfx}1  全文第 1 项", 0), (f"{pfx}2  全文第 2 项", 0)]
         self.demo.data = {"items": items}
         self.demo.update()
 
     def apply_to(self, settings) -> None:
+        setattr(settings, self._en_attr, self.chk.isChecked())
         pfx = "caption_fig_prefix" if self.kind == "figure" else "caption_tab_prefix"
         setattr(settings, pfx, self.prefix.text())
         settings.caption_prefix_auto = self.auto_pfx.isChecked()
         settings.caption_sep = self.sep.currentData() or ""
         settings.caption_by_chapter = self.by_chapter.isChecked()
         settings.caption_start = self.start.value()
+        settings.number_keep_existing = self.keep.isChecked()
 
 
 class ParaFormatDialog(QDialog):
@@ -784,13 +841,31 @@ class ParaFormatDialog(QDialog):
         lay.addLayout(r1)
 
         r2 = QHBoxLayout()
-        self.size = QDoubleSpinBox(); self.size.setRange(4, 72); self.size.setFixedWidth(70)
-        self.line = QDoubleSpinBox(); self.line.setRange(1, 100); self.line.setFixedWidth(70)
+        r2.addWidget(QLabel("字号"))
+        self.size = QDoubleSpinBox()
+        self.size.setRange(4, 72)
+        self.size.setDecimals(1)
+        self.size.setFixedWidth(84)
         self.bold = MarkCheck("加粗")
         r2.addWidget(self.size)
-        r2.addWidget(self.line)
+        r2.addSpacing(8)
         r2.addWidget(self.bold)
+        r2.addStretch()
         lay.addLayout(r2)
+
+        r2b = QHBoxLayout()
+        r2b.addWidget(QLabel("行距"))
+        self.line_rule = QComboBox()
+        for key, text in LINE_RULES:
+            self.line_rule.addItem(text, key)
+        self.line_rule.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.line = QDoubleSpinBox()
+        self.line.setRange(1, 100)
+        self.line.setDecimals(1)
+        self.line.setFixedWidth(84)
+        r2b.addWidget(self.line_rule, 1)
+        r2b.addWidget(self.line)
+        lay.addLayout(r2b)
 
         self.align = QComboBox()
         for key, text in ALIGNS:
@@ -817,6 +892,7 @@ class ParaFormatDialog(QDialog):
 
         for w in (self.font, self.latin, self.align, self.color):
             w.currentIndexChanged.connect(lambda *_: self._changed())
+        self.line_rule.currentIndexChanged.connect(self._line_rule_changed)
         for w in (self.size, self.line):
             w.valueChanged.connect(lambda *_: self._changed())
         self.bold.toggled.connect(lambda *_: self._changed())
@@ -827,8 +903,17 @@ class ParaFormatDialog(QDialog):
         self.on_clear = None
         self.on_clear_all = None
         self.on_role = None
+        # 批量改格式时，一次改多段（Ctrl 多选）
+        self.para_indices: list = [para_index]
 
     # ---------------------------------------------------------------- #
+    def set_para_indices(self, indices) -> None:
+        self.para_indices = list(indices) if isinstance(indices, (list, tuple, set)) \
+            else [indices]
+
+    def primary_index(self) -> int:
+        return self.para_indices[0] if self.para_indices else self.para_index
+
     def set_title(self, text: str) -> None:
         self.title.setText(text)
 
@@ -838,28 +923,63 @@ class ParaFormatDialog(QDialog):
 
     def _role_changed(self) -> None:
         if self.on_role is not None:
-            self.on_role(self.para_index, self.role.currentData())
+            self.on_role(self.para_indices, self.role.currentData())
+
+    def _line_rule_changed(self) -> None:
+        rule = self.line_rule.currentData() or "exact"
+        need_pt = rule in ("exact", "minimum")
+        self.line.setEnabled(need_pt)
+        if need_pt and self.line.value() < 6.0:
+            # 从 1.5 倍切到固定值时，避免把 1.5 当成 1.5 磅导致文字重叠
+            self.line.blockSignals(True)
+            self.line.setValue(max(18.0, round(self.size.value() * 1.5, 1)))
+            self.line.blockSignals(False)
+        self._changed()
 
     def set_value(self, v: dict) -> None:
-        self.font.setCurrentIndex(max(0, self.font.findText(v.get("font", "宋体"))))
-        self.latin.setCurrentIndex(
-            max(0, self.latin.findText(v.get("ascii") or "Times New Roman")))
-        self.size.setValue(float(v.get("size", 12)))
-        self.line.setValue(float(v.get("line", 22)))
-        self.bold.setChecked(bool(v.get("bold")))
-        i = self.align.findData(v.get("align", "left"))
-        self.align.setCurrentIndex(i if i >= 0 else 0)
-        i = self.color.findData(v.get("color") or "")
-        self.color.setCurrentIndex(i if i >= 0 else 0)
+        widgets = (self.font, self.latin, self.size, self.line_rule,
+                   self.line, self.bold, self.align, self.color)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            idx_f = self.font.findText(v.get("font", "宋体"))
+            if idx_f >= 0:
+                self.font.setCurrentIndex(idx_f)
+            else:
+                self.font.addItem(v.get("font", "宋体"))
+                self.font.setCurrentIndex(self.font.count() - 1)
+            idx_l = self.latin.findText(v.get("ascii") or "Times New Roman")
+            if idx_l >= 0:
+                self.latin.setCurrentIndex(idx_l)
+            sz = float(v.get("size", 12))
+            self.size.setValue(sz)
+            rule = v.get("line_rule") or "exact"
+            i_r = self.line_rule.findData(rule)
+            self.line_rule.setCurrentIndex(i_r if i_r >= 0 else 0)
+            need_pt = rule in ("exact", "minimum")
+            self.line.setEnabled(need_pt)
+            lv = float(v.get("line", 22) or 22)
+            if need_pt and lv < 6.0:
+                lv = max(18.0, round(sz * 1.5, 1))
+            self.line.setValue(lv)
+            self.bold.setChecked(bool(v.get("bold")))
+            i = self.align.findData(v.get("align", "left"))
+            self.align.setCurrentIndex(i if i >= 0 else 0)
+            i = self.color.findData(v.get("color") or "")
+            self.color.setCurrentIndex(i if i >= 0 else 0)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
 
     def value(self) -> dict:
+        rule = self.line_rule.currentData() or "exact"
         return {
             "font": self.font.currentText(),
             "ascii": self.latin.currentText(),
             "size": self.size.value(),
             "bold": self.bold.isChecked(),
             "line": self.line.value(),
-            "line_rule": "exact",
+            "line_rule": rule,
             "align": self.align.currentData(),
             "color": self.color.currentData() or "",
         }
@@ -867,11 +987,11 @@ class ParaFormatDialog(QDialog):
     def _changed(self) -> None:
         self.changed = True
         if self.on_change is not None:
-            self.on_change(self.para_index, self.value())
+            self.on_change(self.para_indices, self.value())
 
     def _clear(self) -> None:
         if self.on_clear is not None:
-            self.on_clear(self.para_index)
+            self.on_clear(self.para_indices)
         self.hide()
 
     def _clear_all(self) -> None:

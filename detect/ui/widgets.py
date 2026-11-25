@@ -127,6 +127,17 @@ class MarkCheck(QWidget):
         self.update()
         super().setEnabled(enabled)
 
+    def sizeHint(self):
+        from PySide6.QtCore import QSize
+        from PySide6.QtGui import QFontMetrics
+        f = QFont()
+        f.setPixelSize(FONT)
+        w = BOX + (9 + QFontMetrics(f).horizontalAdvance(self._text) if self._text else 0) + 4
+        return QSize(max(BOX + 4, w), 26)
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
     # ---------------------------------------------------------------- #
     def paintEvent(self, _e) -> None:
         p = QPainter(self)

@@ -185,6 +185,49 @@ QPushButton#primary:disabled { background: #a9cfff; color: #ffffff; }
 QPushButton#ghost { background: transparent; border: 1px solid #d2d2d7; color: #1d1d1f; }
 QPushButton#ghost:hover { background: #f5f5f7; }
 
+/* 「从原稿识别」是 split 按钮（点主体执行、箭头出菜单），外观与 QPushButton 一致 */
+QToolButton {
+    border-radius: 8px;
+    padding: 8px 14px 8px 18px;
+    border: 1px solid transparent;
+    background: #e8e8ed;
+    color: #1d1d1f;
+}
+QToolButton:hover { background: #dedee4; }
+QToolButton:pressed { background: #d3d3d9; }
+QToolButton:disabled { color: #b0b0b6; background: #f0f0f3; }
+QToolButton#primary { background: #007aff; color: #ffffff; font-weight: 600; }
+
+/* 拆成主体 + 箭头两个 QPushButton，包在 0 间距 Fixed 容器里拼成一个完整 split 按钮 */
+QPushButton#split-main {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    padding: 8px 12px 8px 16px;
+}
+QPushButton#split-arrow {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-top-right-radius: 8px;
+    border-bottom-right-radius: 8px;
+    border-left: 1px solid #d2d2d7;
+    padding: 8px 0;
+    min-width: 26px;
+    max-width: 26px;
+}
+QPushButton#split-arrow::menu-indicator {
+    image: none;
+    width: 0;
+    height: 0;
+}
+
+/* 状态栏的「格式方案」：比顶栏按钮小一号 */
+QPushButton#scheme-btn {
+    padding: 3px 10px;
+    font-size: 12px;
+    border-radius: 6px;
+    color: #3a3a3c;
+}
+
 /* 「关于」里的帮助文档：画成一行链接文字，但用 QPushButton 才能
    被 UIAutomation/键盘正常触发（QLabel 的 linkActivated 只认鼠标）。 */
 QPushButton#help-link {
@@ -237,9 +280,36 @@ QLineEdit, QComboBox {
     border-radius: 8px;
     padding: 7px 12px;
     background: #ffffff;
+    color: #1d1d1f;          /* 写死：深色系统主题下别让文字变白看不见 */
 }
 QLineEdit:focus, QComboBox:focus { border: 1px solid #007aff; }
 QComboBox::drop-down { border: none; width: 22px; }
+/* 下拉列表本身也要有确定的颜色（系统主题可能给白底白字） */
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    color: #1d1d1f;
+    selection-background-color: #e8f1ff;
+    selection-color: #1d1d1f;
+    outline: none;
+}
+/* 表格单元格里的组合框/数字框：内边距收小且不裁上下字 */
+QTableWidget QComboBox, QTableWidget QDoubleSpinBox {
+    padding: 2px 6px;
+    min-height: 24px;
+}
+QTableWidget QComboBox::drop-down { width: 18px; }
+
+/* 树控件（格式方案列表）：选中行浅蓝底深字，别用系统高亮的蓝底白字 */
+QTreeWidget {
+    background: #ffffff;
+    border: 1px solid #e5e5ea;
+    border-radius: 10px;
+    outline: none;
+}
+QTreeWidget::item { padding: 5px 8px; }
+QTreeWidget::item:selected { background: #e8f1ff; color: #1d1d1f; }
+QTreeWidget::item:selected:active { background: #e8f1ff; color: #1d1d1f; }
+QTreeWidget::item:hover { background: #f5f5f7; }
 
 /* ============ 参数表 ============ */
 QTableWidget {

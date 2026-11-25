@@ -19,7 +19,7 @@ import re
 
 from docx.oxml.ns import qn
 
-from PySide6.QtCore import QSize, QSizeF, Qt
+from PySide6.QtCore import QSize, QSizeF, Qt, QUrl
 from PySide6.QtGui import (
     QColor,
     QTextFormat,
@@ -32,6 +32,7 @@ from PySide6.QtGui import (
     QTextCharFormat,
     QTextCursor,
     QTextDocument,
+    QTextImageFormat,
     QTextLength,
     QTextTableCellFormat,
     QTextTableFormat,
@@ -72,9 +73,9 @@ PAPER_SIZES = {
 }
 
 MAX_PARAS = 6000        # 安全上限，不再让正常论文被截断
-MAX_TABLES = 30
-MAX_TABLE_ROWS = 10
-MAX_TABLE_CELL = 60
+MAX_TABLES = 120
+MAX_TABLE_ROWS = 25
+MAX_TABLE_CELL = 80
 
 INK_COLOR = QColor("#1d1d1f")
 FALLBACK_CJK = "宋体"
@@ -221,21 +222,92 @@ def iter_blocks(doc) -> list[tuple[str, int]]:
     return out
 
 
-def paragraph_image_blob(doc, paragraph) -> bytes | None:
-    for blip in paragraph._p.findall(".//" + qn("a:blip")):
-        rid = blip.get(qn("r:embed"))
-        if not rid:
-            continue
-        try:
-            part = doc.part.related_parts.get(rid)
-        except Exception:
-            part = None
-        if part is not None:
+_MC_NS = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+_MC_ALT = _MC_NS + "AlternateContent"
+_MC_CHOICE = _MC_NS + "Choice"
+_MC_FALLBACK = _MC_NS + "Fallback"
+_O_RELID = "{urn:schemas-microsoft-com:office:office}relid"
+
+
+def _drawing_size(el) -> tuple[float, float] | None:
+    for ex in el.iter(qn("wp:extent")):
+        cx, cy = ex.get("cx"), ex.get("cy")
+        if cx and cy:
             try:
-                return part.blob
-            except Exception:
-                return None
+                return int(cx) / 12700.0, int(cy) / 12700.0
+            except ValueError:
+                pass
     return None
+
+
+def _rel_blob(doc, rid: str | None) -> bytes | None:
+    if not rid:
+        return None
+    try:
+        part = doc.part.related_parts.get(rid)
+        return part.blob if part is not None else None
+    except Exception:
+        return None
+
+
+def element_images(doc, root_el) -> list[tuple[bytes, tuple[float, float] | None]]:
+    """提取一个 XML 节点（段落或表格单元格）里的所有插图 (blob, 原始尺寸pt)。
+
+    兼容两种 Word 存图方式：
+    - DrawingML（w:drawing → a:blip），现代 docx 默认；
+    - VML（w:pict → v:imagedata），老版 .doc 转 .docx 的封面校徽/插图多走这一路。
+    跳过 w:object（MathType OLE 公式由公式通路画）和 mc:AlternateContent 里重复的 mc:Fallback。
+    """
+    from ..features import vml_size_pt
+
+    out: list[tuple[bytes, tuple[float, float] | None]] = []
+    w_drawing = qn("w:drawing")
+    w_pict = qn("w:pict")
+    w_obj = qn("w:object")
+    a_blip = qn("a:blip")
+    r_embed = qn("r:embed")
+
+    def walk(el) -> None:
+        tag = el.tag
+        if tag == w_obj:
+            return
+        if tag == _MC_ALT:
+            choice = el.find(_MC_CHOICE)
+            fallback = el.find(_MC_FALLBACK)
+            before = len(out)
+            if choice is not None:
+                walk(choice)
+            if len(out) == before and fallback is not None:
+                walk(fallback)
+            return
+        if tag == w_drawing:
+            sz = _drawing_size(el)
+            for blip in el.iter(a_blip):
+                blob = _rel_blob(doc, blip.get(r_embed))
+                if blob:
+                    out.append((blob, sz))
+            return
+        if tag == w_pict:
+            for im in el.iter(_VML_IMG):
+                rid = im.get(_RID) or im.get(_O_RELID)
+                blob = _rel_blob(doc, rid)
+                if blob:
+                    out.append((blob, vml_size_pt(im)))
+            return
+        for ch in el:
+            walk(ch)
+
+    walk(root_el)
+    return out
+
+
+def paragraph_images(doc, paragraph) -> list[tuple[bytes, tuple[float, float] | None]]:
+    return element_images(doc, paragraph._p)
+
+
+def paragraph_image_blob(doc, paragraph) -> bytes | None:
+    imgs = paragraph_images(doc, paragraph)
+    return imgs[0][0] if imgs else None
 
 
 # ------------------------------------------------------------------ #
@@ -283,12 +355,13 @@ def _insert_paragraph(cur: QTextCursor, text: str, cjk: str, latin: str,
                       size: float, bold: bool, line_pt: float,
                       align: str | None, indent_pt: float = 0.0,
                       color: str = "", marks: bool = False,
-                      label_bold: bool = False) -> None:
+                      label_bold: bool = False,
+                      left_margin: float = 0.0) -> None:
     bf = QTextBlockFormat()
     bf.setAlignment(_align_flag(align))
     # 直接给磅值：FixedHeight 的单位就是布局单位（1 单位 = 1 磅）
     bf.setLineHeight(max(1.0, line_pt), _FIXED)
-    bf.setLeftMargin(0)
+    bf.setLeftMargin(max(0.0, left_margin))
     bf.setRightMargin(0)
     if indent_pt:
         bf.setTextIndent(indent_pt)
@@ -325,14 +398,15 @@ def _load_image(blob: bytes, content_w: float,
 
 
 def _insert_image(cur: QTextCursor, blob: bytes, content_w: float,
-                  natural: tuple[float, float] | None = None) -> None:
-    """插入图片（居中，单独一行）。"""
+                  natural: tuple[float, float] | None = None,
+                  align: str | None = "center") -> None:
+    """插入图片（默认居中，单独一行）。"""
     try:
         im = _load_image(blob, content_w, natural)
         if im is None:
             return
         bf = QTextBlockFormat()
-        bf.setAlignment(Qt.AlignHCenter)
+        bf.setAlignment(_align_flag(align or "center"))
         cur.insertBlock(bf)
         cur.insertImage(im)
     except Exception:
@@ -560,6 +634,14 @@ def _scaled_image(blob: bytes, content_w: float, keep_hi: bool = False) -> QImag
     im = QImage()
     im.loadFromData(blob)
     if im.isNull():
+        # Qt 原生不解码 EMF/WMF（老版 Word 常见矢量校徽/图），走 GDI+ 转 PNG
+        from ..emf import emf_to_png
+        target = max(128, int(content_w * (4 if keep_hi else 2)))
+        png = emf_to_png(blob, target)
+        if png is not None:
+            im = QImage()
+            im.loadFromData(Path(png).read_bytes())
+    if im.isNull():
         return None
     if not keep_hi and im.width() > content_w:
         im = im.scaledToWidth(int(content_w), Qt.SmoothTransformation)
@@ -578,27 +660,47 @@ def _leave_table(cur: QTextCursor, table) -> None:
         cur.movePosition(QTextCursor.End)
 
 
+_RULE_URL = "rule://ink"
+
+
+def _ensure_rule_resource(td: QTextDocument) -> None:
+    if td is None:
+        return
+    if not td.resource(QTextDocument.ResourceType.ImageResource, QUrl(_RULE_URL)):
+        im = QImage(QSize(4, 4), QImage.Format.Format_ARGB32)
+        im.fill(INK_COLOR)
+        td.addResource(QTextDocument.ResourceType.ImageResource,
+                       QUrl(_RULE_URL), im)
+
+
 def _rule_block(cur: QTextCursor, content_w: float, width_pt: float,
                 w: float | None = None, off: float = 0.0) -> None:
-    """画一条横线：一个细长的纯色图片（Qt 的块/单元格没有可用的分边边框）。"""
+    """画一条横线：用浮点高度的 QTextImageFormat 拉伸纯色资源。
+
+    相比整像素 QImage（1px 在缩放 60%~75% 时容易被抽丢、0.75pt 与 1.5pt 拉不开差距），
+    QTextImageFormat 支持精确浮点线宽，在各种缩放比下都能稳定区分粗细线。
+    """
     w = float(w) if w else content_w
-    h = max(1, int(round(width_pt)))
-    im = QImage(QSize(max(2, int(round(w))), h), QImage.Format.Format_ARGB32)
-    im.fill(INK_COLOR)
+    h_pt = max(0.75, float(width_pt))
+    _ensure_rule_resource(cur.document())
+    fmt = QTextImageFormat()
+    fmt.setName(_RULE_URL)
+    fmt.setWidth(max(2.0, w))
+    fmt.setHeight(h_pt)
     bf = QTextBlockFormat()
     bf.setAlignment(Qt.AlignLeft)
     bf.setLeftMargin(off)
     bf.setRightMargin(max(0.0, content_w - off - w))
-    bf.setLineHeight(float(h), _FIXED)
+    bf.setLineHeight(max(2.0, h_pt + 0.8), _FIXED)
     # 表格/frame 后面通常已经留了一个空块，直接复用——否则线会和
     # 表格之间空出一行（实测约 16 磅）
     blk = cur.block()
     if blk.isValid() and not blk.text().strip():
         cur.setBlockFormat(bf)
-        cur.insertImage(im)
+        cur.insertImage(fmt)
     else:
         cur.insertBlock(bf)
-        cur.insertImage(im)
+        cur.insertImage(fmt)
 
 
 def _insert_cell_text(cursor: QTextCursor, text: str, cjk: str, latin: str,
@@ -618,15 +720,24 @@ def _leave_frame(cur: QTextCursor, frame) -> None:
 
 def _frame_table(cur: QTextCursor, rows: list, cols: int, content_w: float,
                  line_pt: float, cjk: str, latin: str, size: float, bold: bool,
-                 color: str, align: str, w: float, off: float) -> None:
+                 color: str, align: str, w: float, off: float,
+                 border_pt: float = 0.0,
+                 cell_imgs: list | None = None) -> None:
     """把一个表格包进无边框 frame 里，用 frame 的左右边距控制表格位置。"""
+    col_w = w / max(1, cols)
     tf = QTextTableFormat()
-    tf.setBorder(0)
+    if border_pt > 0:
+        # Qt 的 QTextTableFormat.setBorder 小于 1.0 会被截成 0 而不画线，所以兜底 >= 1.0
+        tf.setBorder(max(1.0, float(border_pt)))
+        tf.setBorderStyle(QTextFrameFormat.BorderStyle.BorderStyle_Solid)
+        tf.setBorderBrush(INK_COLOR)
+    else:
+        tf.setBorder(0)
     tf.setCellPadding(3)
     tf.setCellSpacing(0)
     tf.setWidth(QTextLength(QTextLength.FixedLength, w))
     tf.setColumnWidthConstraints(
-        [QTextLength(QTextLength.FixedLength, w / max(1, cols))] * cols
+        [QTextLength(QTextLength.FixedLength, col_w)] * cols
     )
     ff = QTextFrameFormat()
     ff.setBorder(0)
@@ -636,6 +747,7 @@ def _frame_table(cur: QTextCursor, rows: list, cols: int, content_w: float,
     fr = cur.insertFrame(ff)
     cur.setPosition(fr.firstPosition())
     t = cur.insertTable(len(rows), cols, tf)
+    img_max_w = max(20.0, col_w - 8.0)
     for r, texts in enumerate(rows):
         for c in range(cols):
             cell = t.cellAt(r, c)
@@ -646,8 +758,16 @@ def _frame_table(cur: QTextCursor, rows: list, cols: int, content_w: float,
             bf = QTextBlockFormat()
             bf.setAlignment(_align_flag(align))
             cc.setBlockFormat(bf)
-            _insert_cell_text(cc, texts[c] if c < len(texts) else "",
-                              cjk, latin, size, bold, color)
+            txt = texts[c] if c < len(texts) else ""
+            if txt:
+                _insert_cell_text(cc, txt, cjk, latin, size, bold, color)
+            if cell_imgs and r < len(cell_imgs) and c < len(cell_imgs[r]):
+                for blob, nat in cell_imgs[r][c]:
+                    im = _load_image(blob, img_max_w, nat)
+                    if im is not None:
+                        if txt:
+                            cc.insertBlock(bf)
+                        cc.insertImage(im)
     _leave_frame(cur, fr)
 
 
@@ -656,10 +776,41 @@ def _one_row_table(cur: QTextCursor, texts: list, content_w: float,
                    latin: str = FALLBACK_LATIN, size: float = 10.5,
                    bold: bool = False, color: str = "",
                    align: str = "left", w: float | None = None,
-                   off: float = 0.0) -> None:
+                   off: float = 0.0, cell_imgs: list | None = None) -> None:
     w = float(w) if w else content_w
     _frame_table(cur, [list(texts)], len(texts), content_w, line_pt,
-                 cjk, latin, size, bold, color, align, w, off)
+                 cjk, latin, size, bold, color, align, w, off,
+                 border_pt=0.0,
+                 cell_imgs=[cell_imgs] if cell_imgs is not None else None)
+
+
+def _orig_table_style(table) -> tuple[str, float, float]:
+    """推断原稿表格的框线样式（供原稿侧预览用），避免套用右边设置把原稿框线隐藏。"""
+    tblPr = getattr(table._tbl, "tblPr", None)
+    b = tblPr.find(qn("w:tblBorders")) if tblPr is not None else None
+    if b is None:
+        return "grid", 1.0, 0.75
+    vals = {}
+    for side in ("top", "bottom", "left", "right", "insideH", "insideV"):
+        el = b.find(qn("w:" + side))
+        v = (el.get(qn("w:val")) or "").lower() if el is not None else ""
+        vals[side] = v not in ("", "none", "nil")
+    has_h = vals["top"] or vals["bottom"]
+    has_v = vals["left"] or vals["right"] or vals["insideV"]
+    if has_h and not has_v and not vals["insideH"]:
+        return "three_line", 1.5, 0.75
+    if any(vals.values()):
+        return "grid", 1.0, 0.75
+    # 某些表只在单元格 tcBorders 上画线
+    for row in table.rows[:2]:
+        for cell in row.cells[:4]:
+            tcPr = cell._tc.find(qn("w:tcPr"))
+            tb = tcPr.find(qn("w:tcBorders")) if tcPr is not None else None
+            if tb is not None:
+                for ch in tb:
+                    if (ch.get(qn("w:val")) or "").lower() not in ("", "none", "nil"):
+                        return "grid", 1.0, 0.75
+    return "none", 0.0, 0.0
 
 
 def table_width_pt(table, content_w: float) -> float:
@@ -683,19 +834,18 @@ def table_width_pt(table, content_w: float) -> float:
 
 
 def _insert_table(doc, cur: QTextCursor, t_i: int, content_w: float,
-                  line_pt: float = 1.0, cjk: str = FALLBACK_CJK,
+                  line_pt: float = 1.5, cjk: str = FALLBACK_CJK,
                   latin: str = FALLBACK_LATIN, size: float = 10.5,
                   bold: bool = False, color: str = "", align: str = "left",
-                  pos: str = "center", width_pt: float | None = None) -> None:
-    """自绘三线表。
+                  pos: str = "center", width_pt: float | None = None,
+                  style: str = "three_line",
+                  line_inner: float = 0.75) -> None:
+    """预览表格：支持三线表（两粗一细）、网格表、无线表，并渲染单元格里的图片。
 
-    为什么不用 QTextTable 的边框：实测 PySide6 的 QTextTableCellFormat 上
-    TableCell*Border 属性根本不会被画出来；而单个表格内部又没法插块画线。
-    所以拆成「表头一个表格 + 数据一个表格」，中间和两端用极矮块的下/上边框
-    画三条线，列宽用 setColumnWidthConstraints 固定住，保证上下对齐。
-
-    表格位置（pos）靠把表格包进 QTextFrame、用 frame 的左右边距实现
-    （QTextTable 本身没有对齐属性）。
+    三线表为什么拆分绘制：PySide6 的 QTextTableCellFormat 分边边框不绘制，
+    所以拆成「顶线(粗) + 表头行 + 栏目线(细) + 数据行 + 底线(粗)」，列宽固定以对齐。
+    网格表直接用 QTextTableFormat.setBorder() 画全框线。
+    表格位置（pos）靠外层 QTextFrame 的左右边距控制。
     """
     try:
         table = doc.tables[t_i]
@@ -705,7 +855,6 @@ def _insert_table(doc, cur: QTextCursor, t_i: int, content_w: float,
     if not rows:
         return
     cols = max(1, len(rows[0].cells))
-    three = line_pt > 0
     w = max(20.0, min(float(width_pt or content_w), content_w))
     off = {"left": 0.0,
            "center": (content_w - w) / 2.0,
@@ -717,19 +866,46 @@ def _insert_table(doc, cur: QTextCursor, t_i: int, content_w: float,
         except Exception:
             return ""
 
-    if three:
-        _rule_block(cur, content_w, line_pt, w, off)      # 顶线
-    _one_row_table(cur, [row_text(0, c) for c in range(cols)], content_w,
-                   line_pt, cjk, latin, size, bold, color, align, w, off)
-    if three:
-        _rule_block(cur, content_w, line_pt, w, off)      # 表头线
-    body = [[row_text(r, c) for c in range(cols)]
-            for r in range(1, len(rows))]
-    if body:
-        _frame_table(cur, body, cols, content_w, line_pt, cjk, latin, size,
-                     bold, color, align, w, off)
-    if three:
-        _rule_block(cur, content_w, line_pt, w, off)      # 底线
+    def row_imgs(r, c):
+        try:
+            return element_images(doc, rows[r].cells[c]._tc)
+        except Exception:
+            return []
+
+    all_texts = [[row_text(r, c) for c in range(cols)] for r in range(len(rows))]
+    all_imgs = [[row_imgs(r, c) for c in range(cols)] for r in range(len(rows))]
+
+    if style == "grid":
+        bw = max(1.0, float(line_inner or line_pt or 1.0))
+        _frame_table(cur, all_texts, cols, content_w, line_pt, cjk, latin,
+                     size, bold, color, align, w, off,
+                     border_pt=bw, cell_imgs=all_imgs)
+        cur.insertBlock()
+        return
+
+    if style == "none":
+        _frame_table(cur, all_texts, cols, content_w, 0.0, cjk, latin,
+                     size, bold, color, align, w, off,
+                     border_pt=0.0, cell_imgs=all_imgs)
+        cur.insertBlock()
+        return
+
+    # three_line：两粗一细（顶/底线 outer，栏目线 inner）
+    outer = float(line_pt or 0)
+    inner = float(line_inner or 0) if float(line_inner or 0) > 0 else outer
+    if outer > 0:
+        _rule_block(cur, content_w, outer, w, off)        # 顶线（粗）
+    _one_row_table(cur, all_texts[0], content_w, outer,
+                   cjk, latin, size, bold, color, align, w, off,
+                   cell_imgs=all_imgs[0])
+    if inner > 0:
+        _rule_block(cur, content_w, inner, w, off)        # 栏目线（细）
+    if len(all_texts) > 1:
+        _frame_table(cur, all_texts[1:], cols, content_w, outer, cjk, latin,
+                     size, bold, color, align, w, off,
+                     border_pt=0.0, cell_imgs=all_imgs[1:])
+    if outer > 0:
+        _rule_block(cur, content_w, outer, w, off)        # 底线（粗）
     cur.insertBlock()
 
 
@@ -748,15 +924,19 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
     fig_plans: dict[int, str] = {}
     tab_plans: dict[int, str] = {}
     if side == "after":
-        head_plans = {p.index: p.text for p in plan_heading_numbers(
-            analysis.detections, body_index, settings)}
-        fig_plans = {p.index: p.text for p in plan_caption_numbers(
-            analysis.detections, "figure", settings, feats)}
-        tab_plans = {p.index: p.text for p in plan_caption_numbers(
-            analysis.detections, "table", settings, feats)}
+        if getattr(settings, "enable_number_heading", False):
+            head_plans = {p.index: p.text for p in plan_heading_numbers(
+                analysis.detections, body_index, settings)}
+        if getattr(settings, "enable_number_figure", False):
+            fig_plans = {p.index: p.text for p in plan_caption_numbers(
+                analysis.detections, "figure", settings, feats)}
+        if getattr(settings, "enable_number_table", False):
+            tab_plans = {p.index: p.text for p in plan_caption_numbers(
+                analysis.detections, "table", settings, feats)}
     marks_on = bool(getattr(settings, "enable_marks", True))
-    table_line = float(getattr(settings, "table_line", 1.0) or 0) \
-        if getattr(settings, "table_style", "") == "three_line" else 0.0
+    tbl_style = getattr(settings, "table_style", "three_line") or "three_line"
+    table_outer = float(getattr(settings, "table_line", 1.5) or 0)
+    table_inner = float(getattr(settings, "table_line_inner", 0.75) or 0)
     tbl_cjk = getattr(settings, "table_font", "") or FALLBACK_CJK
     tbl_latin = getattr(settings, "table_ascii", "") or FALLBACK_LATIN
     tbl_size = float(getattr(settings, "table_font_size", 10.5) or 10.5)
@@ -778,10 +958,15 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
     for kind, i in blocks_src:
         if kind == "tbl":
             if shown_tbl < MAX_TABLES:
-                _insert_table(doc, cur, i, content_w, table_line,
+                if side == "before":
+                    st, ow, iw = _orig_table_style(doc.tables[i])
+                else:
+                    st, ow, iw = tbl_style, table_outer, table_inner
+                _insert_table(doc, cur, i, content_w, ow,
                               tbl_cjk, tbl_latin, tbl_size, tbl_bold, tbl_color,
                               tbl_align, tbl_pos,
-                              table_width_pt(doc.tables[i], content_w))
+                              table_width_pt(doc.tables[i], content_w),
+                              style=st, line_inner=iw)
                 shown_tbl += 1
             continue
 
@@ -792,6 +977,7 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
         if not f.has_image and shown >= MAX_PARAS:
             continue
 
+        left_margin = 0.0
         if side == "before":
             cjk = f.east_asia or FALLBACK_CJK
             latin = f.ascii_font or FALLBACK_LATIN
@@ -801,6 +987,7 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
             line_pt = _line_pt_before(f.line_rule, f.line_value, natural)
             align = f.align
             indent_pt = float(f.first_indent_pt or 0.0)
+            left_margin = float(f.left_indent_pt or 0.0)
             color = ""
             text = f.text
             label_bold = False
@@ -808,31 +995,47 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
         else:
             d = analysis.detections[i]
             role = effective_role(d)
-            p = dict(settings.roles.get(role) or settings.roles.get("body") or {})
             ov = (overrides or {}).get(i)
-            if ov:
-                p.update({k: v for k, v in ov.items() if v is not None})
-            cjk = p.get("font") or FALLBACK_CJK
-            latin = p.get("ascii") or FALLBACK_LATIN
-            size = float(p.get("size", 12))
-            bold = bool(p.get("bold"))
-            natural = _natural_pt(latin, size)
-            line_pt = _line_pt(p.get("line_rule") or "exact",
-                               float(p.get("line", 22)), natural)
-            color = p.get("color") or ""
-            align = p.get("align", "left")
-            from ..reflow import indent_chars_of
-            indent_pt = (indent_chars_of(settings) * size
-                         if role == "body" else 0.0)
-            label_bold = bool(getattr(settings, "bold_label", False)) \
-                and role in LABEL_ROLES
-            text = f.text
-            if i in head_plans:
-                text = head_plans[i] + clean_heading(text)
-            elif i in fig_plans:
-                text = fig_plans[i] + clean_caption(text, aggressive=True)
-            elif i in tab_plans:
-                text = tab_plans[i] + clean_caption(text, aggressive=True)
+            if role == "toc_item" and not ov:
+                # 目录条目保留各自层级的字体/字号/加粗/缩进，不压成同一个字号
+                cjk = f.east_asia or FALLBACK_CJK
+                latin = f.ascii_font or FALLBACK_LATIN
+                size = f.size_pt or 12.0
+                bold = bool(f.bold)
+                natural = _natural_pt(latin, size)
+                line_pt = _line_pt_before(f.line_rule, f.line_value, natural)
+                align = "left"
+                indent_pt = 0.0
+                lv = d.level or 1
+                left_margin = float(f.left_indent_pt) if f.left_indent_pt else max(0.0, (lv - 1) * 14.0)
+                color = ""
+                text = f.text
+                label_bold = False
+            else:
+                p = dict(settings.roles.get(role) or settings.roles.get("body") or {})
+                if ov:
+                    p.update({k: v for k, v in ov.items() if v is not None})
+                cjk = p.get("font") or FALLBACK_CJK
+                latin = p.get("ascii") or FALLBACK_LATIN
+                size = float(p.get("size", 12))
+                bold = bool(p.get("bold"))
+                natural = _natural_pt(latin, size)
+                line_pt = _line_pt(p.get("line_rule") or "exact",
+                                   float(p.get("line", 22)), natural)
+                color = p.get("color") or ""
+                align = p.get("align", "left")
+                from ..reflow import indent_chars_of
+                indent_pt = (indent_chars_of(settings) * size
+                             if role == "body" else 0.0)
+                label_bold = bool(getattr(settings, "bold_label", False)) \
+                    and role in LABEL_ROLES
+                text = f.text
+                if i in head_plans:
+                    text = head_plans[i] + clean_heading(text)
+                elif i in fig_plans:
+                    text = fig_plans[i] + clean_caption(text, aggressive=True)
+                elif i in tab_plans:
+                    text = tab_plans[i] + clean_caption(text, aggressive=True)
 
         # ---- 公式：OMML 自绘 / MathType 走 EMF，按文档顺序全部渲染成图 ----
         formula_ims = (_formula_images(doc.paragraphs[i], content_w, size,
@@ -851,21 +1054,19 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
                        for im in formula_ims)
             line_pt = max(line_pt, im_h + 2.0)
             _insert_paragraph(cur, "", cjk, latin, size, bold, line_pt, align,
-                              indent_pt, color, False, False)
+                              indent_pt, color, False, False, left_margin)
             block_of[i] = cur.block()
             _insert_inline_formula(cur, doc.paragraphs[i], formula_ims,
                                    cjk, latin, size, bold, color)
         else:
             _insert_paragraph(cur, text, cjk, latin, size, bold, line_pt, align,
-                              indent_pt, color, marks_on, label_bold)
+                              indent_pt, color, marks_on, label_bold, left_margin)
             block_of[i] = cur.block()
 
         if f.has_image:
-            from ..features import image_size
-            blob = paragraph_image_blob(doc, doc.paragraphs[i])
-            if blob:
-                _insert_image(cur, blob, content_w,
-                              image_size(doc.paragraphs[i]))
+            img_align = align if align in ("left", "center", "right") else "center"
+            for blob, nat in paragraph_images(doc, doc.paragraphs[i]):
+                _insert_image(cur, blob, content_w, nat, img_align)
         elif formula_ims and standalone:
             # 显示公式 + 编号同一行（编号右对齐）
             from ..features import equation_label

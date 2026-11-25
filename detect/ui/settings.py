@@ -106,8 +106,9 @@ RIBBON_GROUPS = [
               ("layout_header", "页眉")]),
     ("前置部分", [("abstract", "摘要标题"), ("abstract_body", "摘要正文"),
                  ("keywords", "关键词"), ("toc", "目录")]),
-    ("其他", [("reference", "参考文献"), ("roles", "识别明细"),
-             ("check", "格式检查"), ("about", "关于")]),
+    ("方案", [("schemes", "格式方案"), ("roles", "识别明细")]),
+    ("其他", [("reference", "参考文献"), ("check", "格式检查"),
+             ("about", "关于")]),
 ]
 
 # 期刊论文：没有目录、不分节。目录卡片仍然显示但置灰（用户要求"能看到但点不了"）。
@@ -123,8 +124,9 @@ RIBBON_GROUPS_JOURNAL = [
     ("页面", [("layout_pagenum", "页码"), ("layout_header", "页眉")]),
     ("前置部分", [("abstract", "摘要"), ("keywords", "关键词"),
                  ("toc", "目录")]),
-    ("其他", [("reference", "参考文献"), ("roles", "识别明细"),
-             ("check", "格式检查"), ("about", "关于")]),
+    ("方案", [("schemes", "格式方案"), ("roles", "识别明细")]),
+    ("其他", [("reference", "参考文献"), ("check", "格式检查"),
+             ("about", "关于")]),
 ]
 
 # 期刊形态下显示但不可点的按钮
@@ -144,7 +146,8 @@ EDITABLE_ROLES = ["title", "heading1", "heading2", "heading3", "body",
 ROLE_LABELS = {
     "title": "论文题目",
     "abstract": "摘要标题", "abstract_body": "摘要正文",
-    "keywords": "关键词", "toc": "目录", "reference": "参考文献",
+    "keywords": "关键词", "toc": "目录标题", "toc_item": "目录条目",
+    "reference": "参考文献",
     "meta": "作者信息",
     "back": "尾注（致谢/基金/声明/附录）",
     "equation": "公式",
@@ -236,9 +239,10 @@ class Settings:
     header_bold: bool = False
     header_color: str = ""              # 空 = 自动（黑）
     header_gap: float = 4.0             # 页眉文字与横线之间的距离
-    # 表格：three_line 三线表 / grid 网格 / none 无线
+    # 表格：three_line 三线表（两粗一细：顶/底 1.5 磅、栏目线 0.75 磅）/ grid 网格 / none 无线
     table_style: str = "three_line"
-    table_line: float = 1.0
+    table_line: float = 1.5
+    table_line_inner: float = 0.75
     table_font_size: float = 10.5
     table_font: str = "宋体"
     table_ascii: str = "Times New Roman"
@@ -265,9 +269,12 @@ class Settings:
     # 开关
     enable_sections: bool = True
     enable_page_numbers: bool = True
-    enable_number_heading: bool = True
-    enable_number_figure: bool = True
-    enable_number_table: bool = True
+    # 编号默认关闭：只有用户明确勾选时才补号/重排，避免改坏原稿已有编号
+    enable_number_heading: bool = False
+    enable_number_figure: bool = False
+    enable_number_table: bool = False
+    # 原稿里已经写着的编号：保留并补缺（默认），还是全部替换重排
+    number_keep_existing: bool = True
     # 正文缩进（首行缩进字符数）
     first_line_indent_chars: float = 2.0
     apply_indent: bool = True
@@ -325,6 +332,12 @@ class Settings:
     def to_json(self) -> dict:
         return asdict(self)
 
+    def scheme_payload(self) -> dict:
+        """存成"格式方案"的完整设置（去掉内存里的 profile 快照）。"""
+        data = self.to_json()
+        data.pop("_profiles", None)
+        return data
+
     @classmethod
     def from_json(cls, data: dict) -> "Settings":
         s = cls()
@@ -337,11 +350,12 @@ class Settings:
                     "enable_page_numbers", "enable_header", "profile",
                     "enable_number_heading",
                     "enable_number_figure", "enable_number_table",
+                    "number_keep_existing",
                     "first_line_indent_chars", "apply_indent", "apply_not_indent",
                     "header_line", "header_line_color", "header_line_style",
                     "header_font", "header_ascii", "header_size", "header_bold",
                     "header_color", "header_gap",
-                    "table_style", "table_line", "table_font_size",
+                    "table_style", "table_line", "table_line_inner", "table_font_size",
                     "table_font", "table_ascii", "table_bold", "table_color",
                     "table_align", "table_pos",
                     "caption_fig_prefix", "caption_tab_prefix", "caption_sep",

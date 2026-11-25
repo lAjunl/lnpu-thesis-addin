@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, QTimer, QPointF, QRectF
-from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPainter, QPen
+from PySide6.QtCore import QEvent, Qt, QTimer, QPoint, QPointF, QRectF
+from PySide6.QtGui import (QActionGroup, QBrush, QColor, QKeySequence,
+                           QLinearGradient, QPainter, QPen, QShortcut)
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QSplitter,
     QFrame,
     QHBoxLayout,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QToolButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -25,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from ..classify import analyze, effective_role
 from .. import __version__
+from .. import schemes
 from .dialogs import (
     CaptionNumberDialog,
     ROLE_TEXT,
@@ -41,7 +45,6 @@ from .dialogs import (
 from .pageview import PageView, PreviewScroll
 from .widgets import PillButton
 from .settings import (
-    PROFILE_LABELS,
     EDITABLE_ROLES,
     JOURNAL_DISABLED,
     ROLE_LABELS,
@@ -53,6 +56,13 @@ from .word_preview import WordPreview
 NUM_KIND = {"num_heading": "heading", "num_figure": "figure", "num_table": "table"}
 LAYOUT_KIND = {"layout_section": "section", "layout_pagenum": "pagenum",
                "layout_header": "header"}
+
+
+def _as_list(x) -> list:
+    """单个段号 / 列表 / 元组 / 集合，统一成列表（批量改格式用）。"""
+    if isinstance(x, (list, tuple, set)):
+        return list(x)
+    return [x]
 
 
 class _LogoIcon(QWidget):
@@ -203,6 +213,14 @@ class MainWindow(QMainWindow):
         self.doc = None
         self.analysis = None
         self.settings = Settings()
+        # 记住上次用的方案：换电脑/发给别人时是空配置，仍是默认两套
+        self.current_scheme = schemes.builtin(self.settings.profile)
+        last = schemes.load_state()
+        sc = schemes.find(last.get("last_name", ""),
+                          last.get("last_kind")) if last.get("last_name") else None
+        if sc is not None:
+            self.settings = sc.settings_obj()
+            self.current_scheme = sc
         self.preview: WordPreview | None = None
         self.applied = False          # 是否已经排过版（缓存里有结果）
         self.cached_out: Path | None = None
@@ -251,35 +269,19 @@ class MainWindow(QMainWindow):
         self._connect_sync()
         self.setCentralWidget(root)
         self._build_profile_switch()
+        # Esc = 取消段落多选
+        QShortcut(QKeySequence("Esc"), self).activated.connect(
+            self._clear_para_selection)
         self.statusBar().showMessage("就绪 — 先打开一个 docx")
 
-    # ---------------------------------------------------------------- #
-    def _build_profile_switch(self) -> None:
-        """论文形态切换放状态栏右侧：它是"这份稿子是什么"，不是高频操作。"""
-        seg = QWidget()
-        seg.setObjectName("seg")
-        sl = QHBoxLayout(seg)
-        sl.setContentsMargins(0, 0, 0, 0)
-        sl.setSpacing(0)
-        self._profile_btns = {}
-        self._profile_keys = {}
-        for key, label in PROFILE_LABELS.items():
-            b = PillButton(label)
-            b.setCheckable(True)
-            b.setChecked(key == self.settings.profile)
-            b.clicked.connect(lambda _=False, bb=b: self._switch_profile(bb))
-            sl.addWidget(b)
-            self._profile_btns[key] = b
-            self._profile_keys[id(b)] = key
-        lab = QLabel("论文类型：")
-        lab.setObjectName("seg-label")
-        holder = QWidget()
-        hl = QHBoxLayout(holder)
-        hl.setContentsMargins(0, 2, 8, 2)
-        hl.setSpacing(6)
-        hl.addWidget(lab)
-        hl.addWidget(seg)
-        self.statusBar().addPermanentWidget(holder)
+    def _clear_para_selection(self) -> None:
+        self.after_view.clear_selection()
+
+    def eventFilter(self, obj, ev) -> bool:
+        # 段落浮动格式条一消失就清空多选，避免下一次误把上一批再改一遍
+        if obj is getattr(self, "_para_dlg", None) and ev.type() == QEvent.Type.Hide:
+            self._clear_para_selection()
+        return super().eventFilter(obj, ev)
 
     # ---------------------------------------------------------------- #
     def _pane(self, head: QLabel, view: QWidget, extra: QWidget = None
@@ -384,14 +386,37 @@ class MainWindow(QMainWindow):
         hl.addWidget(title)
         hl.addSpacing(18)
 
-        self.open_btn = QPushButton("打开 docx")
+        self.open_btn = QPushButton("打开文档")
         self.open_btn.clicked.connect(self.open_file)
         hl.addWidget(self.open_btn)
 
+        # 主体是普通按钮（文字居中），右侧紧贴一个小箭头按钮出二级菜单（0 间距容器）
+        split_box = QWidget()
+        split_box.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        split_hl = QHBoxLayout(split_box)
+        split_hl.setContentsMargins(0, 0, 0, 0)
+        split_hl.setSpacing(0)
         self.detect_btn = QPushButton("从原稿识别")
+        self.detect_btn.setObjectName("split-main")
         self.detect_btn.setEnabled(False)
-        self.detect_btn.clicked.connect(self.detect_format)
-        hl.addWidget(self.detect_btn)
+        self.detect_btn.clicked.connect(self.open_detect_dialog)
+        self.detect_arrow = QPushButton("▾")
+        self.detect_arrow.setObjectName("split-arrow")
+        detect_menu = QMenu(self.detect_arrow)
+        act_cur = detect_menu.addAction("从当前文档识别…")
+        act_cur.triggered.connect(self.open_detect_dialog)
+        act_tpl = detect_menu.addAction("从模板文件识别…")
+        act_tpl.triggered.connect(lambda: self.open_detect_dialog(template=True))
+        detect_menu.addSeparator()
+        act_save_sc = detect_menu.addAction("保存当前设置为方案…")
+        act_save_sc.triggered.connect(self.save_current_as_scheme)
+        act_scheme = detect_menu.addAction("管理格式方案…")
+        act_scheme.triggered.connect(self.open_schemes)
+        self.detect_arrow.setMenu(detect_menu)
+        split_hl.addWidget(self.detect_btn)
+        split_hl.addWidget(self.detect_arrow)
+        hl.addWidget(split_box)
 
         self.compare_btn = QPushButton("在 Word 中对比")
         self.compare_btn.setEnabled(False)
@@ -417,10 +442,73 @@ class MainWindow(QMainWindow):
         hl.addWidget(self.save_btn)
 
         # 窗口偏窄时按钮收缩而不是被截断
-        for b in (self.open_btn, self.detect_btn, self.compare_btn,
-                  self.apply_btn, self.save_btn):
+        for b in (self.open_btn, self.detect_btn, self.detect_arrow,
+                  self.compare_btn, self.apply_btn, self.save_btn):
             b.setMinimumWidth(0)
         return bar
+
+    # ---------------- 格式方案（状态栏） ---------------- #
+    def _build_profile_switch(self) -> None:
+        """状态栏右侧：当前格式方案 + 二级菜单（勾选即用）。"""
+        lab = QLabel("格式方案：")
+        lab.setObjectName("seg-label")
+        self.scheme_btn = QPushButton(self.current_scheme.label)
+        self.scheme_btn.setObjectName("scheme-btn")
+        self.scheme_btn.setToolTip("点一下选择要套用的格式方案")
+        self.scheme_btn.clicked.connect(self._show_scheme_menu)
+        holder = QWidget()
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(0, 2, 8, 2)
+        hl.setSpacing(6)
+        hl.addWidget(lab)
+        hl.addWidget(self.scheme_btn)
+        self.statusBar().addPermanentWidget(holder)
+
+    def _update_scheme_btn(self) -> None:
+        self.scheme_btn.setText(self.current_scheme.label)
+        self.scheme_btn.setToolTip(
+            f"当前方案：{self.current_scheme.label}\n点一下选择其他方案")
+
+    def _scheme_menu(self) -> QMenu:
+        menu = QMenu(self)
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        for kind in schemes.KINDS:
+            menu.addSection(schemes.KIND_LABEL[kind])
+            items = [schemes.builtin(kind)]
+            items += [s for s in schemes.load_user_schemes() if s.kind == kind]
+            for sc in items:
+                act = group.addAction(sc.label)
+                act.setCheckable(True)
+                act.setChecked(sc.name == self.current_scheme.name
+                               and sc.kind == self.current_scheme.kind)
+                act.triggered.connect(
+                    lambda _=False, s=sc: self._apply_scheme(s))
+        menu.addSeparator()
+        if not self.current_scheme.builtin:
+            menu.addAction(f"更新方案「{self.current_scheme.name}」",
+                           self.update_current_scheme)
+            menu.addAction("另存当前设置为新方案…", self.save_current_as_scheme)
+        else:
+            menu.addAction("保存当前设置为方案…", self.save_current_as_scheme)
+        menu.addAction("管理方案…", self.open_schemes)
+        menu.addAction("从模板导入…", lambda: self.open_detect_dialog(template=True))
+        return menu
+
+    def _show_scheme_menu(self) -> None:
+        self._scheme_menu().exec(self.scheme_btn.mapToGlobal(
+            QPoint(0, self.scheme_btn.height())))
+
+    def _apply_scheme(self, sc) -> None:
+        self.settings = sc.settings_obj()
+        self.settings._profiles = {}      # 旧快照作废，避免切换时换回旧值
+        self.current_scheme = sc
+        self._update_scheme_btn()
+        self._rebuild_ribbon()
+        if self.doc is not None:
+            self.refresh_preview()
+        schemes.save_state(sc.name, sc.kind)
+        self.statusBar().showMessage(f"已套用方案「{sc.name}」")
 
     # ---------------- Ribbon ---------------- #
     def _ribbon(self) -> QWidget:
@@ -545,6 +633,9 @@ class MainWindow(QMainWindow):
                     f"识别明细已更新：手工改正 {dlg.changed} 段"
                 )
             return
+        elif key == "schemes":
+            self.open_schemes()
+            return
         elif key == "check":
             self.run_check()
             return
@@ -655,38 +746,21 @@ class MainWindow(QMainWindow):
             "同步滚动已开启：左右两栏一起滑动" if self.sync_on else "同步滚动已关闭")
 
     # ---------------------------------------------------------------- #
-    def _switch_profile(self, btn) -> None:
-        key = self._profile_keys.get(id(btn))
-        if key is None or key == self.settings.profile:
-            return
-        old = self.settings.profile
-        if self.doc is not None:
-            ans = QMessageBox.question(
-                self, "切换论文形态",
-                f"切换到「{PROFILE_LABELS[key]}」会换成该形态的格式预设"
-                f"（页边距、字号、行距、页码方案）。\n"
-                f"当前已经调整过的设置会被新预设覆盖，确定吗？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if ans != QMessageBox.Yes:
-                old_btn = self._profile_btns[old]
-                old_btn.setChecked(True)
-                return
-        self.settings.set_profile(key)
-        self._mark_profile_buttons(key)
-        self._rebuild_ribbon()
-        if self.doc is not None:
-            self.refresh_preview()
-        self.statusBar().showMessage(f"已切换为「{PROFILE_LABELS[key]}」")
-
-    def _mark_profile_buttons(self, key: str) -> None:
-        for k, b in self._profile_btns.items():
-            b.setChecked(k == key)
-
-    # ---------------------------------------------------------------- #
     def _para_menu(self, src: int, global_pos, block=None) -> None:
-        """点中排版后预览里的某一段：弹浮动格式条，改动即时生效。"""
+        """点中排版后预览里的某一段：弹浮动格式条，改动即时生效。
+
+        Ctrl 多选过若干段时，再点其中任意一段 = 批量改这些段。
+        """
         from .dialogs import ParaFormatDialog
+
+        sel = self.after_view.selected_srcs()
+        if src in sel and len(sel) > 1:
+            targets = sorted(sel)
+        else:
+            # 点了一个没选中的段：改成只改它，并清掉旧的多选
+            targets = [src]
+            sel = {src}
+        self.after_view.set_selected_srcs(sel)
 
         role = effective_role(self.analysis.detections[src])
         base = dict(self.settings.roles.get(role) or self.settings.roles.get("body") or {})
@@ -697,11 +771,14 @@ class MainWindow(QMainWindow):
             self.after_view.set_selected_block(block)
 
         dlg = ParaFormatDialog(src, cur, self)
+        dlg.set_para_indices(targets)
         dlg.set_value(cur)
         dlg.set_role(role)
         _preview_txt = self.analysis.features[src].text.strip().replace("\n", " ")[:26]
+        head = (f"已选 {len(targets)} 段" if len(targets) > 1
+                else f"第 {src + 1} 段 · {ROLE_LABELS.get(role, role)}")
         dlg.set_title(
-            f"第 {src + 1} 段 · {ROLE_LABELS.get(role, role)}"
+            head
             + ("（已手动改）" if src in self.overrides else "")
             + (f"\n「{_preview_txt}」" if _preview_txt else ""))
         dlg.adjustSize()
@@ -717,16 +794,19 @@ class MainWindow(QMainWindow):
         dlg.move(x, y)
 
         dlg.on_change = self._override_changed
-        dlg.on_clear = lambda i: self._override_clear(i)
+        dlg.on_clear = self._override_clear
         dlg.on_clear_all = self._override_clear_all
         dlg.on_role = self._apply_role_to_para
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
         self._para_dlg = dlg
+        # 浮动条一消失就清空多选，避免下一次误把上一批再改一遍
+        dlg.installEventFilter(self)
+        self.after_view.on_selection_changed = None
 
-    def _apply_role_to_para(self, i: int, role: str) -> None:
-        """把某一段直接改成某个角色（一级标题 / 图注 / 表注 …）。
+    def _apply_role_to_para(self, indices, role: str) -> None:
+        """把一段（或 Ctrl 多选的若干段）直接改成某个角色。
 
         除了写手动格式，还要把 analysis 里的角色一起改掉——否则编号不会重算
         （用户实测：把某段设成二级标题后，标题号还是老的）。
@@ -734,31 +814,39 @@ class MainWindow(QMainWindow):
         p = self.settings.roles.get(role)
         if not p:
             return
-        self.overrides[i] = dict(p)
-        d = self.analysis.detections[i]
-        d.role = role
-        d.level = (int(role[-1])
-                   if role.startswith("heading") and role != "heading" else None)
-        d.level_confidence = 1.0
-        d.user_confirmed = True
-        if "手工改正" not in d.reasons:
-            d.reasons = list(d.reasons) + ["手工改正"]
+        targets = _as_list(indices)
+        for i in targets:
+            self.overrides[i] = dict(p)
+            d = self.analysis.detections[i]
+            d.role = role
+            d.level = (int(role[-1])
+                       if role.startswith("heading") and role != "heading" else None)
+            d.level_confidence = 1.0
+            d.user_confirmed = True
+            if "手工改正" not in d.reasons:
+                d.reasons = list(d.reasons) + ["手工改正"]
         dlg = self._para_dlg
-        if isinstance(dlg, ParaFormatDialog) and dlg.para_index == i:
+        if isinstance(dlg, ParaFormatDialog):
             dlg.set_value(p)
-            dlg.set_title(f"第 {i + 1} 段 · {ROLE_TEXT.get(role, role)}（已设为该角色）")
+            dlg.set_title(f"已把 {len(targets)} 段设为「{ROLE_TEXT.get(role, role)}」")
+        self._after_change()
+        self.statusBar().showMessage(
+            f"{len(targets)} 段已设为「{ROLE_TEXT.get(role, role)}」，编号已重算")
+
+    def _override_changed(self, indices, fmt: dict) -> None:
+        """indices 可以是单个段号，也可以是列表（Ctrl 多选批量改）。"""
+        for i in _as_list(indices):
+            self.overrides[i] = fmt
+        self.refresh_preview()
+
+    def _override_clear(self, indices) -> None:
+        n = 0
+        for i in _as_list(indices):
+            if self.overrides.pop(i, None) is not None:
+                n += 1
         self.refresh_preview()
         self.statusBar().showMessage(
-            f"第 {i + 1} 段已设为「{ROLE_TEXT.get(role, role)}」，编号已重算")
-
-    def _override_changed(self, i: int, fmt: dict) -> None:
-        self.overrides[i] = fmt
-        self.refresh_preview()
-
-    def _override_clear(self, i: int) -> None:
-        self.overrides.pop(i, None)
-        self.refresh_preview()
-        self.statusBar().showMessage("已恢复该段的角色默认格式")
+            f"已恢复 {n} 段的角色默认格式" if n else "这些段本来就没有手动格式")
 
     def _override_clear_all(self) -> None:
         n = len(self.overrides)
@@ -775,26 +863,39 @@ class MainWindow(QMainWindow):
     def open_file(self) -> None:
         from PySide6.QtWidgets import QFileDialog
 
-        path, _ = QFileDialog.getOpenFileName(self, "打开 Word 文档", "", "Word 文档 (*.docx)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开 Word 文档", "", "Word 文档 (*.docx *.doc)")
         if not path:
             return
         self.open_path(Path(path))
 
     def open_path(self, path: Path) -> bool:
-        """打开指定路径的 docx（按钮、命令行参数、拖拽共用）。"""
-        if path.suffix.lower() != ".docx":
+        """打开指定路径的 docx/doc（按钮、命令行参数、拖拽共用）。"""
+        suf = path.suffix.lower()
+        if suf not in (".docx", ".doc"):
             QMessageBox.information(
                 self, "打不开这个文件",
-                "只支持 .docx（Word 2007 及以后的格式）。\n"
-                "如果是 .doc，请先在 Word 里「另存为」成 .docx 再打开。",
+                "只支持 .docx 或 .doc 格式的 Word 文档。",
             )
             return False
-        self.path = path
+        self._orig_path = path
+        if suf == ".doc":
+            self.statusBar().showMessage(f"正在转换旧版 .doc：{path.name} …")
+            QApplication.processEvents()
+            try:
+                from ..features import ensure_docx
+                docx_path = ensure_docx(path)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.critical(self, "转换 .doc 失败", str(exc))
+                return False
+            self.path = docx_path
+        else:
+            self.path = path
         try:
             from docx import Document
 
             self.doc = Document(str(self.path))
-            self.analysis = analyze(self.doc, source=self.path.name)
+            self.analysis = analyze(self.doc, source=path.name)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "打开失败", str(exc))
             return False
@@ -803,6 +904,7 @@ class MainWindow(QMainWindow):
         self.cached_out = None
         self.save_btn.setEnabled(False)
         self.detect_btn.setEnabled(True)
+        self.detect_arrow.setEnabled(True)
         self.compare_btn.setEnabled(True)
         self.apply_btn.setEnabled(True)
         # 关键：打开后立刻渲染双栏预览，否则两栏是空的
@@ -821,12 +923,12 @@ class MainWindow(QMainWindow):
     # 拖拽：把 docx 拖进窗口（任意位置）直接打开
     # ---------------------------------------------------------------- #
     def _drop_docx(self, event) -> Path | None:
-        """拖拽里的第一个本地 .docx；不是就返回 None。"""
+        """拖拽里的第一个本地 .docx / .doc；不是就返回 None。"""
         for u in event.mimeData().urls():
             if not u.isLocalFile():
                 continue
             p = Path(u.toLocalFile())
-            return p if p.suffix.lower() == ".docx" else None
+            return p if p.suffix.lower() in (".docx", ".doc") else None
         return None
 
     def _drop_hl(self, on: bool, name: str = "") -> None:
@@ -970,19 +1072,88 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def detect_format(self) -> None:
-        from ..recognize import recognize_from_doc
-
-        try:
-            self.settings = recognize_from_doc(self.doc, self.analysis)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "识别失败", str(exc))
+    def open_detect_dialog(self, template: bool = False) -> None:
+        """「格式识别」弹窗：从当前文档或模板文件学格式，核对后再保存/覆盖。"""
+        if self.doc is None or self.analysis is None:
+            QMessageBox.information(self, "格式识别", "请先打开一个文档。")
             return
-        self._after_change()
-        QMessageBox.information(
-            self, "已从原稿识别",
-            "已把原稿各角色的实际格式读入设置。\n请检查并按需调整，然后点「在 Word 中对比」。",
-        )
+        from .scheme_dialogs import DetectDialog
+
+        dlg = DetectDialog(self.doc, self.analysis,
+                           base_settings=self.settings, parent=self)
+        if template:
+            dlg.tpl_radio.setChecked(True)
+            dlg._pick()
+            if not dlg.template_path:
+                return
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.scheme is not None:
+            self._apply_scheme(dlg.scheme)
+        elif dlg.settings is not None:
+            self.settings = dlg.settings
+            self.current_scheme = schemes.builtin(self.settings.profile)
+            self._update_scheme_btn()
+            self._after_change()
+            self.statusBar().showMessage("已把识别结果写入当前设置")
+
+    def open_schemes(self) -> None:
+        """「格式方案」管理弹窗。"""
+        from .scheme_dialogs import FormatSchemeDialog
+
+        dlg = FormatSchemeDialog(self.current_scheme, parent=self,
+                                 import_handler=self._import_scheme,
+                                 save_current_handler=self.save_current_as_scheme)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.current is not None:
+            self._apply_scheme(dlg.current)
+
+    def save_current_as_scheme(self):
+        """把当前手动调好的整套设置存成格式方案（不经过格式识别器）。"""
+        from .scheme_dialogs import SaveSchemeDialog
+
+        dlg = SaveSchemeDialog(self.current_scheme, self.settings, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.scheme is None:
+            return None
+        sc = dlg.scheme
+        self.current_scheme = sc
+        self.settings.profile = sc.kind
+        self._update_scheme_btn()
+        self._rebuild_ribbon()
+        schemes.save_state(sc.name, sc.kind)
+        self.statusBar().showMessage(f"已将当前设置保存为方案「{sc.name}」")
+        return sc
+
+    def update_current_scheme(self) -> None:
+        """把当前修改直接写回正在使用的用户方案。"""
+        sc = self.current_scheme
+        if sc.builtin:
+            self.save_current_as_scheme()
+            return
+        payload = self.settings.scheme_payload()
+        payload["profile"] = sc.kind
+        sc.settings = payload
+        schemes.save(sc)
+        self.statusBar().showMessage(f"已更新方案「{sc.name}」")
+
+    def _import_scheme(self):
+        """给方案弹窗用：打开格式识别，返回新建的方案（取消返回 None）。"""
+        if self.doc is None or self.analysis is None:
+            QMessageBox.information(self, "格式识别", "请先打开一个文档。")
+            return None
+        from .scheme_dialogs import DetectDialog
+
+        dlg = DetectDialog(self.doc, self.analysis,
+                           base_settings=self.settings, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        if dlg.scheme is not None:
+            return dlg.scheme
+        if dlg.settings is not None:
+            self.settings = dlg.settings
+            self._after_change()
+        return None
 
     # ---------------------------------------------------------------- #
     def open_compare(self) -> None:
@@ -1135,14 +1306,18 @@ class MainWindow(QMainWindow):
         if cached is None:
             QMessageBox.information(self, "保存", "请先点「一键排版」生成结果。")
             return
+        orig = getattr(self, "_orig_path", None) or self.path
         if mode == "overwrite":
-            target = self.path
+            if orig.suffix.lower() == ".doc":
+                target = orig.with_name(orig.stem + "_排版.docx")
+            else:
+                target = orig
         else:
             from PySide6.QtWidgets import QFileDialog
 
             chosen, _ = QFileDialog.getSaveFileName(
                 self, "另存为",
-                str(self.path.with_name(self.path.stem + "_排版.docx")),
+                str(orig.with_name(orig.stem + "_排版.docx")),
                 "Word 文档 (*.docx)",
             )
             if not chosen:
@@ -1151,10 +1326,10 @@ class MainWindow(QMainWindow):
         try:
             import shutil
 
-            if target == self.path:
-                backup = self.path.with_suffix(".bak.docx")
+            if target == orig and orig.suffix.lower() == ".docx":
+                backup = orig.with_suffix(".bak.docx")
                 if not backup.exists():
-                    shutil.copyfile(self.path, backup)
+                    shutil.copyfile(orig, backup)
             shutil.copyfile(cached, target)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "保存失败", str(exc))
