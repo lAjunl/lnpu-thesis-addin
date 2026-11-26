@@ -104,10 +104,10 @@ def _set_line_spacing(para, p: dict) -> None:
             pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
         elif rule == "minimum":
             pf.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
-            pf.line_spacing = Pt(float(p.get("line", 22)))
+            pf.line_spacing = Pt(float(p.get("line") or 22))
         else:
             pf.line_spacing_rule = WD_LINE_SPACING.EXACTLY
-            pf.line_spacing = Pt(float(p.get("line", 22)))
+            pf.line_spacing = Pt(float(p.get("line") or 22))
     except Exception:
         pass
 

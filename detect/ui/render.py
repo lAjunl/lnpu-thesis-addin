@@ -1162,10 +1162,10 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
                     p = dict(base or settings.roles.get("body") or {})
                     if ov:
                         p.update({k: v for k, v in ov.items() if v is not None})
-                    size = float(p.get("size", size))
+                    size = float(p.get("size") or size)
                     natural = _natural_pt(p.get("ascii") or latin, size)
                     line_pt = _line_pt(p.get("line_rule") or "exact",
-                                       float(p.get("line", 22)), natural)
+                                       float(p.get("line") or 22), natural)
             _insert_paragraph(
                 cur, "", cjk, latin, size, False, line_pt, f.align,
                 0.0, "", False, False, 0.0,
@@ -1219,11 +1219,11 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
                     p.update({k: v for k, v in ov.items() if v is not None})
                 cjk = p.get("font") or FALLBACK_CJK
                 latin = p.get("ascii") or FALLBACK_LATIN
-                size = float(p.get("size", 12))
+                size = float(p.get("size") or 12)
                 bold = bool(p.get("bold"))
                 natural = _natural_pt(latin, size)
                 line_pt = _line_pt(p.get("line_rule") or "exact",
-                                   float(p.get("line", 22)), natural)
+                                   float(p.get("line") or 22), natural)
                 color = p.get("color") or ""
                 align = p.get("align", "left")
                 from ..reflow import indent_chars_of

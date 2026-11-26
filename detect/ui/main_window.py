@@ -1096,6 +1096,10 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         try:
             self.refresh_preview()
+        except Exception as exc:  # noqa: BLE001
+            self.statusBar().showMessage(f"预览生成失败：{exc}")
+            QMessageBox.critical(self, "预览生成失败", str(exc))
+            return False
         finally:
             QApplication.restoreOverrideCursor()
 

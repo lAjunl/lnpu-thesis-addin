@@ -71,7 +71,7 @@ class RoleDialog(_BaseDialog):
 
         self.size = QDoubleSpinBox()
         self.size.setRange(4, 72)
-        self.size.setValue(float(value.get("size", 12)))
+        self.size.setValue(float(value.get("size") or 12))
         self.row("字号（磅）", self.size)
 
         self.font = QComboBox()
@@ -102,7 +102,7 @@ class RoleDialog(_BaseDialog):
         self.line.setRange(1, 100)
         lv0 = float(value.get("line", 22) or 22)
         if rule0 in ("exact", "minimum") and lv0 < 6.0:
-            lv0 = max(18.0, round(float(value.get("size", 12)) * 1.5, 1))
+            lv0 = max(18.0, round(float(value.get("size") or 12) * 1.5, 1))
         self.line.setValue(lv0)
         self.line.setEnabled(rule0 in ("exact", "minimum"))
         self.row("行距（磅）", self.line)

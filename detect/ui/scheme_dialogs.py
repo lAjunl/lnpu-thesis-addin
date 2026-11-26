@@ -63,12 +63,12 @@ def _scheme_summary(sc: schemes.Scheme) -> str:
         r = s.roles.get(role)
         if not r:
             continue
-        parts = [f"{float(r.get('size', 12)):g} 磅"]
+        parts = [f"{float(r.get('size') or 12):g} 磅"]
         parts.append(f"{r.get('font', '宋体')} / {r.get('ascii', 'Times New Roman')}")
         if r.get("bold"):
             parts.append("加粗")
         rule = r.get("line_rule") or "exact"
-        value = r.get("line", 22)
+        value = float(r.get("line") or 22)
         if rule == "multiple":
             parts.append("1.5 倍行距")
         elif rule == "multiple2":

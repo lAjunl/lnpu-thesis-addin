@@ -1279,6 +1279,22 @@ def main() -> int:
               y5 < blk_content[1] and y7 >= blk_content[1] - 0.5 and pc_b == 2,
               f"y5={y5:.1f} y7={y7:.1f} pages={pc_b} ch={blk_content[1]:.1f}")
 
+    # ---- 兼容旧方案中 line=None（如从模板识别单倍行距公式后存下的方案）----
+    null_set = Settings()
+    null_set.roles["body"]["line"] = None
+    null_set.roles["body"]["line_rule"] = "single"
+    null_set.roles["equation"]["line"] = None
+    null_set.roles["equation"]["line_rule"] = "single"
+    td_null, _ = render_side(blk_doc, blk_ana, null_set, "after", blk_content)
+    check("预览兼容方案中 line=None（单倍行距角色不崩）",
+          page_count(td_null) >= 1, f"pages={page_count(td_null)}")
+    from detect.recognize import settings_from_report as _apply_rep
+    _rep_s = _apply_rep(Settings(), {"roles": {"equation": {"line": ("single", None)}}})
+    check("格式识别写回单倍行距时不把 role.line 覆盖成 None",
+          _rep_s.roles["equation"]["line_rule"] == "single"
+          and _rep_s.roles["equation"]["line"] is not None,
+          repr(_rep_s.roles["equation"]))
+
     print("\n" + ("全部通过" if not FAIL else f"失败 {len(FAIL)} 项: {FAIL}"))
     win.close()
     return 1 if FAIL else 0

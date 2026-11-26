@@ -639,7 +639,9 @@ def recognize_from_doc(doc, analysis, report: dict | None = None) -> Settings:
         if align:
             cur["align"] = align
         if setting:
-            cur["line_rule"], cur["line"] = setting[0], setting[1]
+            cur["line_rule"] = setting[0]
+            if setting[1] is not None:
+                cur["line"] = setting[1]
 
         if report is not None:
             report["roles"][role] = {
@@ -731,7 +733,9 @@ def settings_from_report(base: Settings, report: dict) -> Settings:
             cur["align"] = attrs["align"]
         setting = attrs.get("line")
         if setting:
-            cur["line_rule"], cur["line"] = setting[0], setting[1]
+            cur["line_rule"] = setting[0]
+            if setting[1] is not None:
+                cur["line"] = setting[1]
     page = report.get("page") or {}
     for key in ("top", "bottom", "left", "right", "header", "footer"):
         if page.get(key) is not None:
