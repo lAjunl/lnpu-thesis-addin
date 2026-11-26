@@ -1295,6 +1295,87 @@ def main() -> int:
           and _rep_s.roles["equation"]["line"] is not None,
           repr(_rep_s.roles["equation"]))
 
+    # ---- 表格边框识别（Table Grid 改三线表、无线表、识别弹窗核对条）----
+    from docx.oxml import OxmlElement as _OxmlElement
+    from docx.oxml.ns import qn as _qn
+    from detect.recognize import inspect_table_format as _inspect_tbl
+    from detect.ui.scheme_dialogs import DetectDialog as RecognizeDialog
+    from detect.ui.dialogs import ParaFormatDialog, ROLE_CHOICES
+
+    _bdr_doc = Document()
+    _t3 = _bdr_doc.add_table(rows=2, cols=2)
+    _t3.style = "Table Grid"
+    _t3.cell(0, 0).text = "列A"
+    _t3.cell(1, 0).text = "1"
+    _tp3 = _t3._tbl.find(_qn("w:tblPr"))
+    _tb3 = _OxmlElement("w:tblBorders")
+    for _side, _val, _sz in (("top", "single", "12"), ("bottom", "single", "12"),
+                             ("left", "none", "0"), ("right", "none", "0"),
+                             ("insideH", "none", "0"), ("insideV", "none", "0")):
+        _e = _OxmlElement(f"w:{_side}")
+        _e.set(_qn("w:val"), _val)
+        _e.set(_qn("w:sz"), _sz)
+        _tb3.append(_e)
+    _tp3.append(_tb3)
+    for _tc in _t3._tbl.tr_lst[0].tc_lst:
+        _tcPr = _tc.get_or_add_tcPr()
+        _tcb = _OxmlElement("w:tcBorders")
+        _bot = _OxmlElement("w:bottom")
+        _bot.set(_qn("w:val"), "single")
+        _bot.set(_qn("w:sz"), "4")
+        _tcb.append(_bot)
+        _tcPr.append(_tcb)
+    _res3 = _inspect_tbl(_bdr_doc)
+    check("表格边框识别：Table Grid 显式去竖线识别为三线表且读出线宽",
+          _res3["style"] == "three_line" and _res3["line"] == 1.5 and _res3["line_inner"] == 0.5,
+          repr(_res3))
+
+    _none_doc = Document()
+    _tn = _none_doc.add_table(rows=2, cols=2)
+    _tn.cell(0, 0).text = "无线"
+    _tpn = _tn._tbl.find(_qn("w:tblPr"))
+    _tbn = _OxmlElement("w:tblBorders")
+    for _side in ("top", "bottom", "left", "right", "insideH", "insideV"):
+        _e = _OxmlElement(f"w:{_side}")
+        _e.set(_qn("w:val"), "none")
+        _e.set(_qn("w:sz"), "0")
+        _tbn.append(_e)
+    _tpn.append(_tbn)
+    _resn = _inspect_tbl(_none_doc)
+    check("表格边框识别：全无框线识别为 none",
+          _resn["style"] == "none", repr(_resn))
+
+    _rdlg = RecognizeDialog(doc=_bdr_doc, analysis=analyze(_bdr_doc, "bdr.docx"),
+                            base_settings=Settings())
+    _rdlg._detect()
+    check("格式识别器弹窗正确回填表格边框样式与线宽",
+          _rdlg.tbl_style.currentData() == "three_line"
+          and abs(_rdlg.tbl_line.value() - 1.5) < 1e-6
+          and abs(_rdlg.tbl_line_inner.value() - 0.5) < 1e-6,
+          f"st={_rdlg.tbl_style.currentData()} o={_rdlg.tbl_line.value()} i={_rdlg.tbl_line_inner.value()}")
+    _rdlg.tbl_style.setCurrentIndex(_rdlg.tbl_style.findData("grid"))
+    _rdlg.tbl_line.setValue(1.0)
+    _rdlg.tbl_line_inner.setValue(0.75)
+    _cre = _rdlg._collect()
+    _cs = _apply_rep(Settings(), _cre)
+    check("格式识别器弹窗修改表格边框后正确写回方案",
+          _cs.table_style == "grid" and _cs.table_line == 1.0 and _cs.table_line_inner == 0.75,
+          f"st={_cs.table_style} o={_cs.table_line} i={_cs.table_line_inner}")
+    _rdlg.close()
+
+    # ---- 悬浮菜单「设为」包含「作者信息」(meta) 且排在前排可设 ----
+    _meta_idx = [k for k, _ in ROLE_CHOICES].index("meta") if any(k == "meta" for k, _ in ROLE_CHOICES) else -1
+    _meta_label = dict(ROLE_CHOICES).get("meta", "")
+    check("悬浮菜单角色列表包含「作者信息」(meta) 且排在前列",
+          0 <= _meta_idx <= 2 and _meta_label == "作者信息",
+          f"idx={_meta_idx} label={_meta_label!r}")
+    _pdlg = ParaFormatDialog(0, Settings().roles["body"])
+    _pdlg.set_role("meta")
+    check("悬浮菜单下拉框可选中「作者信息」",
+          _pdlg.role.currentData() == "meta" and _pdlg.role.currentText() == "作者信息",
+          f"data={_pdlg.role.currentData()!r} text={_pdlg.role.currentText()!r}")
+    _pdlg.close()
+
     print("\n" + ("全部通过" if not FAIL else f"失败 {len(FAIL)} 项: {FAIL}"))
     win.close()
     return 1 if FAIL else 0

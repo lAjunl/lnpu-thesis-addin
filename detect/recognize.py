@@ -124,9 +124,45 @@ def _border_pt(el) -> float | None:
         return None
 
 
+def _border_state(el) -> tuple[bool, float | None] | None:
+    """解析单条边框元素：未定义返回 None；显式 none/nil 返回 (False, None)；可见返回 (True, pt)。"""
+    from docx.oxml.ns import qn as _qn
+    if el is None:
+        return None
+    v = (el.get(_qn("w:val")) or "").strip().lower()
+    if not v:
+        return None
+    if v in ("none", "nil"):
+        return (False, None)
+    return (True, _border_pt(el))
+
+
+def _first_row_style_bottom_pt(tbl, tbl_chain) -> float | None:
+    """查表格样式链里 firstRow 条件样式的底边框线宽（部分三线表把表头线定义在这里）。"""
+    from docx.oxml.ns import qn as _qn
+    tblPr = tbl._tbl.find(_qn("w:tblPr"))
+    look = tblPr.find(_qn("w:tblLook")) if tblPr is not None else None
+    if look is not None:
+        fr = look.get(_qn("w:firstRow"))
+        if fr in ("0", "false", "off"):
+            return None
+    for st in tbl_chain:
+        for tsp in st.element.findall(_qn("w:tblStylePr")):
+            if tsp.get(_qn("w:type")) != "firstRow":
+                continue
+            tcPr = tsp.find(_qn("w:tcPr"))
+            tcb = tcPr.find(_qn("w:tcBorders")) if tcPr is not None else None
+            state = _border_state(tcb.find(_qn("w:bottom")) if tcb is not None else None)
+            if state is not None:
+                return state[1] if state[0] else None
+    return None
+
+
 def inspect_table_format(doc, tables=None, style_index: StyleIndex | None = None) -> dict:
     """从文档表格中实测样式、表内字体/字号、表头/表体加粗、对齐与线宽。
 
+    边框识别遵循 OOXML 继承顺序：
+    表格自身 w:tblBorders（逐边覆盖）→ 样式链 w:tblBorders → firstRow 条件样式与单元格 w:tcBorders。
     未实测到的项一律返回 None，绝不拿默认值冒充识别结果。
     """
     from docx.oxml.ns import qn as _qn
@@ -161,15 +197,19 @@ def inspect_table_format(doc, tables=None, style_index: StyleIndex | None = None
     w_val = _qn("w:val")
     w_tcPr = _qn("w:tcPr")
     w_tcBorders = _qn("w:tcBorders")
+    w_top = _qn("w:top")
     w_bottom = _qn("w:bottom")
+    w_left = _qn("w:left")
+    w_right = _qn("w:right")
     w_p = _qn("w:p")
     w_pPr = _qn("w:pPr")
+    sides = ("top", "bottom", "left", "right", "insideH", "insideV")
+    w_sides = {s: _qn("w:" + s) for s in sides}
 
     for tbl in target:
         tblPr = tbl._tbl.find(w_tblPr)
         bdr = tblPr.find(w_tblBorders) if tblPr is not None else None
         t_st = si.table_style(tbl)
-        st_name = (t_st.name if t_st is not None else "").lower()
         tbl_chain = si.chain_of(t_st)
         first_row_style_b = _tbl_first_row_bold(tbl, tbl_chain)
 
@@ -180,38 +220,122 @@ def inspect_table_format(doc, tables=None, style_index: StyleIndex | None = None
                 if pv:
                     t_pos.append(pv)
 
-        has_v = False
-        has_h = False
+        # 1) 汇总有效表格级 6 条边：表格自身逐边覆盖样式链（显式 none/nil 覆盖样式里的线）
+        eff: dict[str, tuple[bool, float | None] | None] = {s: None for s in sides}
         if bdr is not None:
-            for side in ("left", "right", "insideV"):
-                el = bdr.find(_qn("w:" + side))
-                if el is not None and el.get(w_val) not in (None, "none", "nil"):
-                    has_v = True
-            for side in ("top", "bottom"):
-                el = bdr.find(_qn("w:" + side))
-                if el is not None and el.get(w_val) not in (None, "none", "nil"):
-                    has_h = True
-                    pt = _border_pt(el)
-                    if pt:
-                        t_outer.append(pt)
-            for side in ("insideH", "insideV"):
-                pt = _border_pt(bdr.find(_qn("w:" + side)))
-                if pt:
-                    t_inner.append(pt)
+            for s in sides:
+                st_b = _border_state(bdr.find(w_sides[s]))
+                if st_b is not None:
+                    eff[s] = st_b
+        for st in tbl_chain:
+            if all(eff[s] is not None for s in sides):
+                break
+            stp = st.element.find(w_tblPr)
+            sb = stp.find(w_tblBorders) if stp is not None else None
+            if sb is None:
+                continue
+            for s in sides:
+                if eff[s] is None:
+                    st_b = _border_state(sb.find(w_sides[s]))
+                    if st_b is not None:
+                        eff[s] = st_b
 
+        # 2) 采样单元格 tcBorders（首行 / 次行 / 末行）
         tr_lst = tbl._tbl.tr_lst
-        if has_v or "grid" in st_name:
-            t_styles.append("grid")
-        elif has_h:
-            t_styles.append("three_line")
-            # 三线表栏目线通常写在首行单元格的 tcBorders/bottom
-            if tr_lst:
-                for tc in tr_lst[0].tc_lst[:8]:
+        cell_v_pts: list[float] = []
+        cell_has_v = False
+        cell_top_pts: list[float] = []
+        cell_last_bottom_pts: list[float] = []
+        cell_r0_bottom_pts: list[float] = []
+        cell_r1_top_pts: list[float] = []
+        cell_has_h = False
+
+        if tr_lst:
+            sample_rows = [(0, tr_lst[0])]
+            if len(tr_lst) > 1:
+                sample_rows.append((1, tr_lst[1]))
+            if len(tr_lst) > 2:
+                sample_rows.append((-1, tr_lst[-1]))
+            for r_tag, tr in sample_rows:
+                for tc in tr.tc_lst[:8]:
                     tcPr = tc.find(w_tcPr)
                     tb = tcPr.find(w_tcBorders) if tcPr is not None else None
-                    pt = _border_pt(tb.find(w_bottom) if tb is not None else None)
-                    if pt:
-                        t_inner.append(pt)
+                    if tb is None:
+                        continue
+                    for side_tag in (w_left, w_right):
+                        st_v = _border_state(tb.find(side_tag))
+                        if st_v and st_v[0]:
+                            cell_has_v = True
+                            if st_v[1]:
+                                cell_v_pts.append(st_v[1])
+                    st_top = _border_state(tb.find(w_top))
+                    st_bot = _border_state(tb.find(w_bottom))
+                    if r_tag == 0:
+                        if st_top and st_top[0]:
+                            cell_has_h = True
+                            if st_top[1]:
+                                cell_top_pts.append(st_top[1])
+                        if st_bot and st_bot[0]:
+                            cell_has_h = True
+                            if st_bot[1]:
+                                cell_r0_bottom_pts.append(st_bot[1])
+                    elif r_tag == 1:
+                        if st_top and st_top[0]:
+                            cell_has_h = True
+                            if st_top[1]:
+                                cell_r1_top_pts.append(st_top[1])
+                        if len(tr_lst) == 2 and st_bot and st_bot[0]:
+                            cell_has_h = True
+                            if st_bot[1]:
+                                cell_last_bottom_pts.append(st_bot[1])
+                    elif r_tag == -1:
+                        if st_bot and st_bot[0]:
+                            cell_has_h = True
+                            if st_bot[1]:
+                                cell_last_bottom_pts.append(st_bot[1])
+
+        tbl_has_v = any(eff[s] is not None and eff[s][0]
+                        for s in ("left", "right", "insideV"))
+        tbl_has_h = any(eff[s] is not None and eff[s][0]
+                        for s in ("top", "bottom"))
+        has_v = tbl_has_v or cell_has_v
+        has_h = tbl_has_h or cell_has_h
+
+        if has_v:
+            t_styles.append("grid")
+            outer_pts = [eff[s][1] for s in ("top", "bottom", "left", "right")
+                         if eff[s] is not None and eff[s][0] and eff[s][1]]
+            if outer_pts:
+                t_outer.extend(outer_pts)
+            else:
+                t_outer.extend(cell_top_pts + cell_last_bottom_pts + cell_v_pts)
+            inner_pts = [eff[s][1] for s in ("insideH", "insideV")
+                         if eff[s] is not None and eff[s][0] and eff[s][1]]
+            if inner_pts:
+                t_inner.extend(inner_pts)
+            elif cell_v_pts or cell_r0_bottom_pts:
+                t_inner.extend(cell_r0_bottom_pts + cell_v_pts)
+        elif has_h:
+            t_styles.append("three_line")
+            outer_pts = [eff[s][1] for s in ("top", "bottom")
+                         if eff[s] is not None and eff[s][0] and eff[s][1]]
+            if outer_pts:
+                t_outer.extend(outer_pts)
+            else:
+                t_outer.extend(cell_top_pts + cell_last_bottom_pts)
+            # 三线表栏目线优先级：首行 tcBorders/bottom → 次行 tcBorders/top → firstRow 样式 → insideH
+            if cell_r0_bottom_pts:
+                t_inner.extend(cell_r0_bottom_pts)
+            elif cell_r1_top_pts:
+                t_inner.extend(cell_r1_top_pts)
+            else:
+                fr_pt = _first_row_style_bottom_pt(tbl, tbl_chain)
+                if fr_pt:
+                    t_inner.append(fr_pt)
+                elif eff["insideH"] is not None and eff["insideH"][0] and eff["insideH"][1]:
+                    t_inner.append(eff["insideH"][1])
+        else:
+            t_styles.append("none")
 
         for r_idx, tr in enumerate(tr_lst[:6]):
             for tc in tr.tc_lst[:8]:

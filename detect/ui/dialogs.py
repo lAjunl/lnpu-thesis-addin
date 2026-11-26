@@ -599,6 +599,7 @@ class AboutDialog(QDialog):
 # 角色选项：value = 写回 Detection.role 的值（heading1/2/3 已含层级）
 ROLE_CHOICES = [
     ("title", "论文题目"),
+    ("meta", "作者信息"),
     ("heading1", "一级标题"),
     ("heading2", "二级标题"),
     ("heading3", "三级标题"),
@@ -608,12 +609,13 @@ ROLE_CHOICES = [
     ("figure", "图"),
     ("table", "表格"),
     ("equation", "公式"),
-    ("reference", "参考文献"),
-    ("abstract", "摘要"),
+    ("abstract", "摘要标题"),
+    ("abstract_body", "摘要正文"),
     ("keywords", "关键词"),
+    ("reference", "参考文献"),
     ("toc", "目录标题"),
     ("toc_item", "目录条目"),
-    ("meta", "封面信息"),
+    ("back", "尾注（致谢/附录）"),
     ("other", "其他"),
 ]
 ROLE_TEXT = dict(ROLE_CHOICES)

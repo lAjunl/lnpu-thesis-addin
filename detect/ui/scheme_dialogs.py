@@ -469,6 +469,41 @@ class DetectDialog(QDialog):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         lay.addWidget(self.table, 1)
 
+        # ---- 表格边框核对条（一眼可见三线表/网格/无线与线宽，可微调后再保存）----
+        tbl_bar = QHBoxLayout()
+        tbl_bar.setSpacing(10)
+        tbl_bar.addWidget(QLabel("表格边框"))
+        self.tbl_style = QComboBox()
+        for key, text in (("three_line", "三线表（顶线+表头线+底线）"),
+                          ("grid", "网格（全部框线）"),
+                          ("none", "无线")):
+            self.tbl_style.addItem(text, key)
+        tbl_bar.addWidget(self.tbl_style)
+        tbl_bar.addWidget(QLabel("外框"))
+        self.tbl_line = QDoubleSpinBox()
+        self.tbl_line.setRange(0.25, 6.0)
+        self.tbl_line.setDecimals(2)
+        self.tbl_line.setSingleStep(0.25)
+        self.tbl_line.setSuffix(" 磅")
+        self.tbl_line.setValue(float(getattr(base_settings, "table_line", 1.5) or 1.5))
+        tbl_bar.addWidget(self.tbl_line)
+        tbl_bar.addWidget(QLabel("内框/表头线"))
+        self.tbl_line_inner = QDoubleSpinBox()
+        self.tbl_line_inner.setRange(0.25, 6.0)
+        self.tbl_line_inner.setDecimals(2)
+        self.tbl_line_inner.setSingleStep(0.25)
+        self.tbl_line_inner.setSuffix(" 磅")
+        self.tbl_line_inner.setValue(
+            float(getattr(base_settings, "table_line_inner", 0.75) or 0.75))
+        tbl_bar.addWidget(self.tbl_line_inner)
+        tbl_bar.addStretch(1)
+        self.tbl_bdr_status = QLabel("未识别（无表格）")
+        self.tbl_bdr_status.setStyleSheet("color: #8a8f98;")
+        tbl_bar.addWidget(self.tbl_bdr_status)
+        self.tbl_style.currentIndexChanged.connect(self._sync_tbl_border_enabled)
+        self._sync_tbl_border_enabled()
+        lay.addLayout(tbl_bar)
+
         # ---- 页眉核对条（一眼可见是否识别到页眉，可随时开关/改字）----
         hdr_bar = QHBoxLayout()
         hdr_bar.setSpacing(10)
@@ -521,6 +556,11 @@ class DetectDialog(QDialog):
 
         self._cells: dict[str, list] = {}
         self._tbl_cells: dict | None = None
+
+    def _sync_tbl_border_enabled(self) -> None:
+        has_line = (self.tbl_style.currentData() or "three_line") != "none"
+        self.tbl_line.setEnabled(has_line)
+        self.tbl_line_inner.setEnabled(has_line)
 
     # ---------------------------------------------------------------- #
     def _pick(self) -> None:
@@ -709,6 +749,28 @@ class DetectDialog(QDialog):
             "align": t_al,
         }
 
+        # ---- 填充表格边框核对条 ----
+        bdr_style = tbl.get("style")
+        bdr_detected = bdr_style is not None
+        st_key = bdr_style or getattr(self.base, "table_style", "three_line") or "three_line"
+        s_idx = self.tbl_style.findData(st_key)
+        self.tbl_style.setCurrentIndex(s_idx if s_idx >= 0 else 0)
+        outer_v = tbl.get("line")
+        if outer_v is None:
+            outer_v = getattr(self.base, "table_line", 1.5) or 1.5
+        self.tbl_line.setValue(float(outer_v))
+        inner_v = tbl.get("line_inner")
+        if inner_v is None:
+            inner_v = getattr(self.base, "table_line_inner", 0.75) or 0.75
+        self.tbl_line_inner.setValue(float(inner_v))
+        self._sync_tbl_border_enabled()
+        if bdr_detected:
+            self.tbl_bdr_status.setText(f"实测（{int(tbl.get('count') or 0)} 个表）")
+            self.tbl_bdr_status.setStyleSheet("")
+        else:
+            self.tbl_bdr_status.setText("未识别（无表格）")
+            self.tbl_bdr_status.setStyleSheet("color: #8a8f98;")
+
         # ---- 填充页眉核对条 ----
         hdr = self.report.get("header") or {}
         has_hdr = bool(hdr.get("enabled") and (hdr.get("text") or "").strip())
@@ -763,6 +825,9 @@ class DetectDialog(QDialog):
             tbl["header_bold"] = bool(self._tbl_cells["header_bold"].isChecked())
             tbl["bold"] = bool(self._tbl_cells["bold"].isChecked())
             tbl["align"] = self._tbl_cells["align"].currentData() or "left"
+            tbl["style"] = self.tbl_style.currentData() or "three_line"
+            tbl["line"] = float(self.tbl_line.value())
+            tbl["line_inner"] = float(self.tbl_line_inner.value())
         htext = self.hdr_text.text().strip()
         h_on = bool(self.hdr_enable.isChecked() and htext)
         hdr = self.report.setdefault("header", {})
