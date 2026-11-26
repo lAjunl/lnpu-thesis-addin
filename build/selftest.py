@@ -762,10 +762,12 @@ def main() -> int:
     from docx.oxml.ns import qn as _qn
     from detect.classify import effective_role as _er
 
+    out_doc = Document(str(win.cached_out))
+    out_paras = out_doc.paragraphs
     body_idx = [d.index for d in win.analysis.detections if _er(d) == "body"]
     n_ind = 0
     for i in body_idx:
-        pPr = win.doc.paragraphs[i]._p.pPr
+        pPr = out_paras[i]._p.pPr
         ind = pPr.find(_qn("w:ind")) if pPr is not None else None
         if ind is not None and ind.get(_qn("w:firstLineChars")):
             n_ind += 1
@@ -777,7 +779,7 @@ def main() -> int:
     if eq_idx:
         tabbed = 0
         for i in eq_idx:
-            pPr = win.doc.paragraphs[i]._p.pPr
+            pPr = out_paras[i]._p.pPr
             tabs = pPr.find(_qn("w:tabs")) if pPr is not None else None
             if tabs is not None:
                 tabbed += 1
@@ -934,6 +936,294 @@ def main() -> int:
     if ddlg.scheme is not None:
         schemes.delete(ddlg.scheme)
     ddlg.close()
+
+    # ---- 表内字体识别、核对表编辑、表头/表体独立加粗 ----
+    from detect.recognize import inspect_table_format as _itf, recognize_from_doc as _rfd, settings_from_report as _sfr
+    from detect.reflow import style_tables as _stbl
+    from detect.ui.dialogs import TableDialog as _TableDialog
+    from docx.enum.text import WD_ALIGN_PARAGRAPH as _WDA
+
+    tdoc = Document()
+    tdoc.add_paragraph("1 引言")
+    tbl = tdoc.add_table(rows=2, cols=2)
+    for r_i, vals in enumerate((("参数", "数值"), ("压力", "10.5 MPa"))):
+        for c_i, txt in enumerate(vals):
+            p = tbl.cell(r_i, c_i).paragraphs[0]
+            p.alignment = _WDA.CENTER
+            run = p.add_run(txt)
+            from detect.reflow import set_run_font as _srf
+            _srf(run, "仿宋", "Arial", 9.5, r_i == 0)
+
+    tan = analyze(tdoc, source="tbl_test.docx")
+    trep = {}
+    ts_rec = _rfd(tdoc, tan, report=trep)
+    ti = trep.get("table") or {}
+    check("表内字体识别：中文/西文/字号/对齐",
+          ti.get("font") == "仿宋" and ti.get("ascii") == "Arial"
+          and ti.get("size") == 9.5 and ti.get("align") == "center",
+          str(ti))
+    check("表内加粗识别：表头与表体拆开",
+          ti.get("header_bold") is True and ti.get("bold") is False
+          and ts_rec.table_header_bold is True and ts_rec.table_bold is False,
+          f"hb={ti.get('header_bold')} bb={ti.get('bold')}")
+
+    # 无表格文档：report["table"] 必须留 None，不拿默认值冲掉 base
+    nodoc = Document()
+    nodoc.add_paragraph("正文段落测试内容。")
+    noan = analyze(nodoc, source="no_tbl.docx")
+    norep = {}
+    _rfd(nodoc, noan, report=norep)
+    base_keep = Settings()
+    base_keep.table_font = "黑体"
+    base_keep.table_header_bold = False
+    merged = _sfr(base_keep, norep)
+    check("无表格文档不拿默认值冒充表内识别",
+          norep["table"]["font"] is None and norep["table"]["header_bold"] is None
+          and merged.table_font == "黑体" and merged.table_header_bold is False,
+          str(norep["table"]))
+
+    # 老版本方案 JSON 兼容：只有 table_bold 时 table_header_bold 自动沿用
+    old_s = Settings.from_json({"table_bold": True})
+    check("老方案兼容：缺 table_header_bold 时继承 table_bold",
+          old_s.table_bold is True and old_s.table_header_bold is True, "")
+
+    # Word 导出：表头与表体加粗分别生效（且关闭时显式写 val="0"）
+    s_hb = Settings()
+    s_hb.table_font, s_hb.table_ascii, s_hb.table_font_size = "黑体", "Times New Roman", 10.0
+    s_hb.table_header_bold, s_hb.table_bold = True, False
+    _stbl(tdoc, s_hb)
+    r0_b = tdoc.tables[0].rows[0].cells[0].paragraphs[0].runs[0].font.bold
+    r1_b = tdoc.tables[0].rows[1].cells[0].paragraphs[0].runs[0].font.bold
+    check("Word 表格导出：表头加粗、表体不加粗",
+          r0_b is True and r1_b is False, f"r0={r0_b} r1={r1_b}")
+    s_hb.table_header_bold, s_hb.table_bold = False, True
+    _stbl(tdoc, s_hb)
+    r0_b2 = tdoc.tables[0].rows[0].cells[0].paragraphs[0].runs[0].font.bold
+    r1_b2 = tdoc.tables[0].rows[1].cells[0].paragraphs[0].runs[0].font.bold
+    check("Word 表格导出：切换为表头不加粗、表体加粗",
+          r0_b2 is False and r1_b2 is True, f"r0={r0_b2} r1={r1_b2}")
+
+    # TableDialog 双复选框读写与示意图同步
+    td_ui = _TableDialog(s_hb, win)
+    check("TableDialog 载入表头/表体加粗分离状态",
+          td_ui.header_bold.isChecked() is False and td_ui.bold.isChecked() is True
+          and td_ui.demo.data.get("header_bold") is False
+          and td_ui.demo.data.get("bold") is True, str(td_ui.demo.data))
+    td_ui.header_bold.setChecked(True)
+    td_ui.bold.setChecked(False)
+    td_ui.apply_to(s_hb)
+    check("TableDialog 写回表头/表体加粗",
+          s_hb.table_header_bold is True and s_hb.table_bold is False, "")
+    td_ui.close()
+
+    # DetectDialog 核对表包含「表格内文字」行，且修改后能覆盖设置
+    ddlg2 = DetectDialog(tdoc, tan, base_settings=Settings(), parent=win)
+    ddlg2._detect()
+    last_row = ddlg2.table.rowCount() - 1
+    row_name = ddlg2.table.item(last_row, 0).text() if last_row >= 0 else ""
+    check("格式识别核对表含「表格内文字」行",
+          row_name == "表格内文字" and ddlg2._tbl_cells is not None,
+          repr(row_name))
+    if ddlg2._tbl_cells is not None:
+        ddlg2._tbl_cells["font"].setCurrentText("楷体")
+        ddlg2._tbl_cells["ascii"].setCurrentText("Calibri")
+        ddlg2._tbl_cells["size"].setValue(9.0)
+        ddlg2._tbl_cells["header_bold"].setChecked(True)
+        ddlg2._tbl_cells["bold"].setChecked(False)
+        ddlg2._tbl_cells["align"].setCurrentIndex(
+            ddlg2._tbl_cells["align"].findData("right"))
+        ddlg2._apply_now()
+        s_out = ddlg2.settings
+        check("格式识别核对表修改表内字体与双加粗生效",
+              s_out is not None and s_out.table_font == "楷体"
+              and s_out.table_ascii == "Calibri" and s_out.table_font_size == 9.0
+              and s_out.table_header_bold is True and s_out.table_bold is False
+              and s_out.table_align == "right",
+              "" if s_out is None else f"{s_out.table_font}/{s_out.table_ascii}/{s_out.table_font_size}/hb={s_out.table_header_bold}/bb={s_out.table_bold}/{s_out.table_align}")
+    ddlg2.close()
+
+    # ---- 页眉识别防误判与彻底清理 ----
+    from detect.recognize import inspect_header_format as _ihf
+    from detect.sections import configure as _cfg_sec, plans_from_settings as _pfs
+
+    # 1) 1 页文档开启「首页不同」，first_page_header 空、sec.header 残留旧校名 → 不得误判为有页眉
+    gh_doc = Document()
+    gh_doc.sections[0].different_first_page_header_footer = True
+    gh_doc.sections[0].header.paragraphs[0].add_run("某模板残留校名页眉")
+    gh_doc.add_paragraph("1 引言")
+    gh_doc.add_paragraph("简短单页正文，肉眼在 Word 里完全看不到页眉。")
+    gh_info = _ihf(gh_doc)
+    check("页眉识别：单页首页不同隐藏的残留校名不误判",
+          gh_info["enabled"] is False and gh_info["text"] == "", str(gh_info))
+
+    # 2) 多节文档：封面节残留校名、正文节无页眉 → 按正文体量投票判定无页眉
+    cv_doc = Document()
+    cv_doc.sections[0].header.paragraphs[0].add_run("某模板残留封面校名")
+    cv_doc.add_paragraph("封面标题")
+    sec_body = cv_doc.add_section()
+    sec_body.header.is_linked_to_previous = False
+    cv_doc.add_paragraph("1 正文标题")
+    cv_doc.add_paragraph("正文内容非常长" * 80)
+    cv_info = _ihf(cv_doc)
+    check("页眉识别：仅封面残留页眉但正文无页眉时不误判",
+          cv_info["enabled"] is False and cv_info["text"] == "", str(cv_info))
+
+    # 3) 纯白字/隐藏字页眉 → 不误判
+    hid_doc = Document()
+    hr = hid_doc.sections[0].header.paragraphs[0].add_run("隐藏校名页眉")
+    from docx.oxml import OxmlElement as _OE
+    _rpr = hr._r.get_or_add_rPr()
+    _col = _OE("w:color")
+    _col.set(_qn("w:val"), "FFFFFF")
+    _rpr.append(_col)
+    hid_doc.add_paragraph("正文内容" * 30)
+    hid_info = _ihf(hid_doc)
+    check("页眉识别：纯白隐藏字不误判为页眉",
+          hid_info["enabled"] is False and hid_info["text"] == "", str(hid_info))
+
+    # 4) 多页文档开启「首页不同」但第 2 页起确有页眉 → 准确识别文字与字体
+    real_hdoc = Document()
+    real_hdoc.sections[0].different_first_page_header_footer = True
+    rhr = real_hdoc.sections[0].header.paragraphs[0].add_run("真实学术论文页眉")
+    _srf(rhr, "楷体", "Times New Roman", 9.5, False)
+    real_hdoc.add_paragraph("首页标题")
+    real_hdoc.add_page_break()
+    real_hdoc.add_paragraph("第二页正文内容" * 40)
+    rh_info = _ihf(real_hdoc)
+    check("页眉识别：多页文档真实页眉与字号准确识别",
+          rh_info["enabled"] is True and rh_info["text"] == "真实学术论文页眉"
+          and rh_info["font"] == "楷体" and rh_info["size"] == 9.5, str(rh_info))
+
+    # 5) base 开启了页眉（如学位方案），识别无页眉文档覆盖后必须关闭 enable_header
+    base_with_hdr = Settings()
+    base_with_hdr.enable_header = True
+    base_with_hdr.header_text = "旧方案遗留校名页眉"
+    gh_an = analyze(gh_doc, source="无页眉文档.docx")
+    gh_rep: dict = {}
+    _rfd(gh_doc, gh_an, report=gh_rep)
+    merged_nohdr = _sfr(base_with_hdr, gh_rep)
+    check("格式识别覆盖：无页眉文档关闭旧方案的 enable_header",
+          merged_nohdr.enable_header is False and merged_nohdr.header_text == "",
+          f"en={merged_nohdr.enable_header} txt={merged_nohdr.header_text!r}")
+
+    # 6) DetectDialog 页眉核对条显示与开关回写
+    ddlg3 = DetectDialog(gh_doc, gh_an, base_settings=base_with_hdr, parent=win)
+    ddlg3._detect()
+    check("格式识别弹窗：无页眉文档自动取消勾选启用页眉",
+          ddlg3.hdr_enable.isChecked() is False and ddlg3.hdr_text.text() == "",
+          f"chk={ddlg3.hdr_enable.isChecked()} txt={ddlg3.hdr_text.text()!r}")
+    ddlg3._apply_now()
+    check("格式识别弹窗：无页眉文档覆盖设置后关闭页眉",
+          ddlg3.settings is not None and ddlg3.settings.enable_header is False
+          and ddlg3.settings.header_text == "", "")
+    ddlg3.close()
+
+    # 7) Word 导出：关闭页眉时彻底清除残留页眉文字、首页页眉与横线
+    clr_doc = Document()
+    clr_doc.sections[0].different_first_page_header_footer = True
+    clr_doc.sections[0].header.paragraphs[0].add_run("残留默认页眉")
+    clr_doc.sections[0].first_page_header.paragraphs[0].add_run("残留首页页眉")
+    ppr0 = clr_doc.sections[0].header.paragraphs[0]._p.get_or_add_pPr()
+    pbdr = _OE("w:pBdr")
+    bot = _OE("w:bottom")
+    bot.set(_qn("w:val"), "single")
+    bot.set(_qn("w:sz"), "6")
+    pbdr.append(bot)
+    ppr0.append(pbdr)
+    clr_doc.add_paragraph("正文内容")
+    s_nohdr = Settings()
+    s_nohdr.profile = "journal"
+    s_nohdr.enable_header = False
+    s_nohdr.header_text = ""
+    _cfg_sec(clr_doc, _pfs(s_nohdr), s_nohdr)
+    rem_def = "".join(p.text for p in clr_doc.sections[0].header.paragraphs).strip()
+    rem_fst = "".join(p.text for p in clr_doc.sections[0].first_page_header.paragraphs).strip()
+    rem_bdr = clr_doc.sections[0].header.paragraphs[0]._p.find(".//" + _qn("w:pBdr"))
+    check("Word 导出：无页眉时彻底清除默认/首页页眉与残留横线",
+          rem_def == "" and rem_fst == "" and rem_bdr is None,
+          f"def={rem_def!r} fst={rem_fst!r} bdr={rem_bdr}")
+
+    # ---- 表格底纹清除、单元格首行缩进清零、原稿侧预览缓存与幂等 apply ----
+    shd_doc = Document()
+    shd_tbl = shd_doc.add_table(rows=2, cols=2)
+    # 模拟蓝色表头底纹（tcPr/w:shd + tblStyle）和单元格首行缩进（firstLine=422）
+    _ts = _OE("w:tblStyle")
+    _ts.set(_qn("w:val"), "GridTable4-Accent1")
+    shd_tbl._tbl.tblPr.append(_ts)
+    for c_i, txt in enumerate(("序号", "内容")):
+        c = shd_tbl.rows[0].cells[c_i]
+        tcPr = c._tc.get_or_add_tcPr()
+        _sh = _OE("w:shd")
+        _sh.set(_qn("w:val"), "clear")
+        _sh.set(_qn("w:fill"), "B5C7EA")
+        tcPr.append(_sh)
+        p = c.paragraphs[0]
+        p.add_run(txt)
+        _ind = p._p.get_or_add_pPr().get_or_add_ind()
+        _ind.set(_qn("w:firstLine"), "422")
+    shd_tbl.rows[1].cells[0].paragraphs[0].add_run("1")
+    shd_tbl.rows[1].cells[0].paragraphs[0]._p.get_or_add_pPr().get_or_add_ind().set(_qn("w:firstLine"), "420")
+    shd_tbl.rows[1].cells[1].paragraphs[0].add_run("测试正文")
+
+    s_shd = Settings()
+    s_shd.table_style = "three_line"
+    s_shd.table_clear_shading = True
+    _stbl(shd_doc, s_shd)
+    rem_shd = list(shd_tbl._tbl.iter(_qn("w:shd")))
+    rem_ts = list(shd_tbl._tbl.iter(_qn("w:tblStyle")))
+    ind_r0 = shd_tbl.rows[0].cells[0].paragraphs[0]._p.find(_qn("w:pPr")).find(_qn("w:ind"))
+    ind_r1 = shd_tbl.rows[1].cells[0].paragraphs[0]._p.find(_qn("w:pPr")).find(_qn("w:ind"))
+    check("Word 表格导出：默认清除表头蓝色底纹与内置着色表格样式",
+          len(rem_shd) == 0 and len(rem_ts) == 0,
+          f"shd={len(rem_shd)} tblStyle={len(rem_ts)}")
+    check("Word 表格导出：表内单元格首行缩进显式清零（防窄列序号断行）",
+          ind_r0 is not None and ind_r0.get(_qn("w:firstLine")) == "0"
+          and ind_r0.get(_qn("w:firstLineChars")) == "0"
+          and ind_r1 is not None and ind_r1.get(_qn("w:firstLine")) == "0",
+          f"r0={dict(ind_r0.attrib) if ind_r0 is not None else None}")
+
+    # 取消勾选清除底纹时保留原底纹
+    keep_doc = Document()
+    keep_tbl = keep_doc.add_table(rows=1, cols=1)
+    _sh2 = _OE("w:shd")
+    _sh2.set(_qn("w:val"), "clear")
+    _sh2.set(_qn("w:fill"), "B5C7EA")
+    keep_tbl.rows[0].cells[0]._tc.get_or_add_tcPr().append(_sh2)
+    keep_tbl.rows[0].cells[0].paragraphs[0].add_run("表头")
+    s_keep = Settings()
+    s_keep.table_clear_shading = False
+    _stbl(keep_doc, s_keep)
+    check("Word 表格导出：关闭清除底纹选项时保留原表底纹",
+          len(list(keep_tbl._tbl.iter(_qn("w:shd")))) == 1, "")
+
+    # TableDialog 载入与写回 table_clear_shading
+    s_td = Settings()
+    s_td.table_clear_shading = False
+    tdlg_shd = _TableDialog(s_td, win)
+    check("TableDialog 载入清除底纹开关",
+          tdlg_shd.clear_shading.isChecked() is False, "")
+    tdlg_shd.clear_shading.setChecked(True)
+    tdlg_shd.apply_to(s_td)
+    check("TableDialog 写回清除底纹开关",
+          s_td.table_clear_shading is True, "")
+    tdlg_shd.close()
+
+    # 原稿侧预览缓存命中：调非页边距设置时直接复用同一份 before QTextDocument
+    win.refresh_preview()
+    bef_doc_1 = win.before_view._doc
+    win.settings.table_header_bold = not win.settings.table_header_bold
+    win.refresh_preview()
+    bef_doc_2 = win.before_view._doc
+    check("长文档优化：调非页边距设置时复用原稿侧 QTextDocument 缓存",
+          bef_doc_1 is not None and bef_doc_1 is bef_doc_2, "")
+
+    from detect import __repo_url__ as _repo_url
+    from detect.ui.dialogs import AboutDialog as _AboutDialog
+    adlg = _AboutDialog(win)
+    check("关于弹窗显示可点击 GitHub 地址",
+          _repo_url in adlg.repo_label.text() and adlg.repo_label.openExternalLinks(),
+          adlg.repo_label.text())
+    adlg.close()
 
     print("\n" + ("全部通过" if not FAIL else f"失败 {len(FAIL)} 项: {FAIL}"))
     win.close()

@@ -260,16 +260,19 @@ class DemoWidget(QWidget):
             p.setPen(QPen(LINE, 1, Qt.PenStyle.DashLine))
             p.drawRect(int(x), int(y0), int(w), int(rows * rh))
 
-        # 单元格示意文字
+        # 单元格示意文字：表头与表体加粗分别跟随设置
+        header_bold = bool(d.get("header_bold", True))
+        body_bold = bool(d.get("bold", False))
         all_rows = [cols] + vals
         for r, row_txts in enumerate(all_rows):
+            is_bold = header_bold if r == 0 else body_bold
             for c, txt in enumerate(row_txts):
                 cx = x + w * c / 3 + 10
                 cy = y0 + r * rh + 15
-                self._label(p, cx, cy, txt, INK, 9.5, r == 0)
+                self._label(p, cx, cy, txt, INK, 9.5, is_bold)
 
         note = {
-            "three_line": f"三线表：顶/底线 {outer:g} 磅（粗）· 栏目线 {inner:g} 磅（细）",
+            "three_line": f"三线表：顶/底 {outer:g} 磅（粗）· 栏目 {inner:g} 磅（细）",
             "grid": f"网格表：外框 {outer:g} 磅 · 内线 {inner:g} 磅",
             "none": "无线表：不显示框线",
         }.get(style, "")

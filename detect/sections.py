@@ -171,8 +171,9 @@ def split_document(doc, front_index: int, body_index: int) -> list:
     若原稿已有 ≥ 3 节（如 3 节学位论文、含横向表格页的 7 节 / 15 节报告），
     保留原稿全部分节不插入多余分节符，交由 configure() 按段落位置映射各分区。
     """
-    if not (0 < front_index < body_index < len(doc.paragraphs)):
-        raise ValueError(f"切分点非法：front={front_index} body={body_index} n={len(doc.paragraphs)}")
+    paras = doc.paragraphs
+    if not (0 < front_index < body_index < len(paras)):
+        raise ValueError(f"切分点非法：front={front_index} body={body_index} n={len(paras)}")
 
     if len(doc.sections) >= 3:
         return list(doc.sections)
@@ -180,9 +181,9 @@ def split_document(doc, front_index: int, body_index: int) -> list:
     starts = _starts_of_sections(doc)
     # 先切后面的，避免插入元素导致前面的索引漂移
     if body_index not in starts:
-        insert_break_before(doc.paragraphs[body_index])
+        insert_break_before(paras[body_index])
     if front_index not in starts:
-        insert_break_before(doc.paragraphs[front_index])
+        insert_break_before(paras[front_index])
 
     return list(doc.sections)
 
@@ -286,6 +287,30 @@ def _expand_plans(doc, plans: list[SectionPlan],
     raise ValueError(f"节数 {n} 与计划数 {len(plans)} 不符")
 
 
+def _clear_header_part(hdr) -> None:
+    """清空一个页眉部分：删掉所有文字、旧横线、多余段落与页眉内表格。"""
+    elem = hdr._element
+    for tbl in list(elem.findall(qn("w:tbl"))):
+        elem.remove(tbl)
+    paras = list(hdr.paragraphs)
+    for idx, p in enumerate(paras):
+        if idx == 0:
+            _clear_paragraph(p)
+            pPr = p._p.find(qn("w:pPr"))
+            _remove(pPr, "pBdr")
+        else:
+            parent = p._p.getparent()
+            if parent is not None:
+                parent.remove(p._p)
+
+
+def _has_header_ref(section, kind: str) -> bool:
+    for ref in section._sectPr.findall(qn("w:headerReference")):
+        if ref.get(qn("w:type")) == kind:
+            return True
+    return False
+
+
 def configure(doc, plans: list[SectionPlan] | None = None,
               settings=None,
               front_index: int | None = None,
@@ -299,11 +324,20 @@ def configure(doc, plans: list[SectionPlan] | None = None,
         # 页眉
         header = section.header
         header.is_linked_to_previous = plan.link_to_previous
-        if header.paragraphs:
-            p = header.paragraphs[0]
-            _clear_paragraph(p)
-            if plan.header_text:
-                p.add_run(plan.header_text)
+        _clear_header_part(header)
+        if plan.header_text:
+            if header.paragraphs:
+                header.paragraphs[0].add_run(plan.header_text)
+        else:
+            # 明确不要页眉时，把首页页眉/偶数页页眉里的模板残留也清掉
+            if section.different_first_page_header_footer or _has_header_ref(section, "first"):
+                fh = section.first_page_header
+                fh.is_linked_to_previous = False
+                _clear_header_part(fh)
+            if _has_header_ref(section, "even"):
+                eh = section.even_page_header
+                eh.is_linked_to_previous = False
+                _clear_header_part(eh)
         # 页脚：页码一律居中（学校规范与 Word 默认都是居中，
         # 旧版没设对齐 → 页码贴在左边）
         footer = section.footer
@@ -322,9 +356,10 @@ def configure(doc, plans: list[SectionPlan] | None = None,
 
 
 def plans_from_settings(settings) -> list[SectionPlan]:
-    """按设置生成各节计划。enable_header=False 时所有节都不写页眉。"""
+    """按设置生成各节计划。enable_header=False 或页眉文字为空时所有节都不写页眉。"""
     profile = getattr(settings, "profile", "thesis")
-    text = settings.header_text if getattr(settings, "enable_header", True) else None
+    raw_text = (getattr(settings, "header_text", "") or "").strip()
+    text = raw_text if (getattr(settings, "enable_header", True) and raw_text) else None
     nums = getattr(settings, "enable_page_numbers", True)
 
     if profile == "journal":

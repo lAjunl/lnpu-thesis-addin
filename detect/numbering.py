@@ -266,9 +266,10 @@ def _prefix_run(paragraph, text: str) -> None:
 
 def apply_plans(doc, plans: list[NumberPlan]) -> int:
     """把编号插进文档。返回插入数量。"""
+    paras = doc.paragraphs
     n = 0
     for plan in plans:
-        para = doc.paragraphs[plan.index]
+        para = paras[plan.index]
         # 原文已有的编号先剥掉，避免"图4.1 Figure 1."这种重复
         if plan.kind in ("figure", "table"):
             old = "".join(r.text for r in para.runs)

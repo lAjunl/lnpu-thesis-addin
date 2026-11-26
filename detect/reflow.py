@@ -246,34 +246,96 @@ def _apply_para(para, p: dict, role: str | None = None,
         _bold_leading_label(para, bool(p.get("bold")))
 
 
-def _table_fonts(settings) -> tuple[str, str, float, bool, str]:
+def _table_fonts(settings) -> tuple[str, str, float, bool, bool, str]:
+    body_bold = bool(getattr(settings, "table_bold", False))
+    header_bold = bool(getattr(settings, "table_header_bold", body_bold))
     return (
         getattr(settings, "table_font", "") or "宋体",
         getattr(settings, "table_ascii", "") or "Times New Roman",
         float(getattr(settings, "table_font_size", 10.5) or 10.5),
-        bool(getattr(settings, "table_bold", False)),
+        header_bold,
+        body_bold,
         (getattr(settings, "table_color", "") or "").strip(),
     )
 
 
+def _set_explicit_bold(rPr, bold: bool) -> None:
+    """表内 run 显式写 w:b（关掉时写 val="0"），避免被表格样式 firstRow 强行加粗。"""
+    _remove_toggle(rPr, "b")
+    b = OxmlElement("w:b")
+    bCs = OxmlElement("w:bCs")
+    if not bold:
+        b.set(qn("w:val"), "0")
+        bCs.set(qn("w:val"), "0")
+    rPr.append(b)
+    rPr.append(bCs)
+
+
+def _clear_cell_indent(p_el) -> None:
+    """清掉表格单元格段落的首行/悬挂缩进。
+
+    必须显式写 firstLine=0 / firstLineChars=0 而非删掉 w:ind：
+    许多文档的 Normal 样式自带 2 字符首行缩进，删掉 w:ind 会继承回去，
+    导致表格窄列（如「序号」）被顶断行、数字贴右框线。
+    """
+    pPr = p_el.get_or_add_pPr()
+    ind = pPr.get_or_add_ind()
+    for attr in ("w:hanging", "w:hangingChars"):
+        if ind.get(qn(attr)) is not None:
+            del ind.attrib[qn(attr)]
+    ind.set(qn("w:firstLine"), "0")
+    ind.set(qn("w:firstLineChars"), "0")
+
+
 def _apply_table_fonts(doc, settings) -> int:
-    """表内文字统一成设置的字体/字号/加粗/字色/对齐（表头与数据行一视同仁）。"""
-    cjk, latin, size, bold, color = _table_fonts(settings)
+    """表内文字统一成设置的字体/字号/字色/对齐并清除单元格首行缩进；
+    表头（首行）与表体（数据行）加粗分别控制。
+    """
+    from docx.text.paragraph import Paragraph
+
+    cjk, latin, size, header_bold, body_bold, color = _table_fonts(settings)
     align = ALIGN_MAP.get(getattr(settings, "table_align", "left"))
+    clear_shading = bool(getattr(settings, "table_clear_shading", True))
+    w_p = qn("w:p")
+    w_r = qn("w:r")
+    w_vert = qn("w:vertAlign")
+    w_val = qn("w:val")
+    w_color = qn("w:color")
+    color_hex = color.replace("#", "") if color else ""
+
     n = 0
     for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
+        for r_idx, tr in enumerate(table._tbl.tr_lst):
+            row_bold = header_bold if r_idx == 0 else body_bold
+            for tc in tr.tc_lst:
+                for p_el in tc.findall(w_p):
+                    para = Paragraph(p_el, table)
                     if align is not None:
                         para.paragraph_format.alignment = align
-                    if para.runs:
-                        for run in para.runs:
-                            set_run_font(run, cjk, latin, size, bold, color)
+                    _clear_cell_indent(p_el)
+                    if clear_shading:
+                        _remove(p_el.find(qn("w:pPr")), "shd")
+                    r_els = list(p_el.iter(w_r))
+                    if r_els:
+                        for r_el in r_els:
+                            rPr = r_el.get_or_add_rPr()
+                            va = rPr.find(w_vert)
+                            script = va is not None and va.get(w_val) in (
+                                "superscript", "subscript")
+                            _set_rpr_font(rPr, cjk, latin, size, row_bold,
+                                          family_only=script)
+                            if not script:
+                                _set_explicit_bold(rPr, row_bold)
+                            for el in rPr.findall(w_color):
+                                rPr.remove(el)
+                            if color_hex:
+                                rPr.get_or_add_color().set(w_val, color_hex)
+                            if clear_shading:
+                                _remove(rPr, "shd")
                     else:
                         _set_para_default_font(
                             para, {"font": cjk, "ascii": latin, "size": size,
-                                   "bold": bold})
+                                   "bold": row_bold})
         n += 1
     return n
 
@@ -304,16 +366,34 @@ def _apply_table_position(doc, settings) -> int:
 
 
 def style_tables(doc, settings) -> int:
-    """表格样式：三线表（两粗一细：顶/底线粗、栏目线细）/ 网格 / 无线；并统一表内字体。"""
+    """表格样式：三线表（两粗一细：顶/底线粗、栏目线细）/ 网格 / 无线；
+    统一表内字体、清除单元格首行缩进，并按设置清除原表/表头底纹。
+    """
     style = getattr(settings, "table_style", "three_line")
     outer = float(getattr(settings, "table_line", 1.5) or 0)
     inner = float(getattr(settings, "table_line_inner", 0.75) or 0)
+    clear_shading = bool(getattr(settings, "table_clear_shading", True))
     _apply_table_fonts(doc, settings)
     _apply_table_position(doc, settings)
+
+    w_tcPr = qn("w:tcPr")
     n = 0
     for table in doc.tables:
         tblPr = table._tbl.tblPr
         _remove(tblPr, "tblBorders")
+        if clear_shading:
+            # 去掉原表格底纹与带着色表头的 Word 内置表格样式（如蓝色表头/条纹行）
+            _remove(tblPr, "shd")
+            _remove(tblPr, "tblStyle")
+            _remove(tblPr, "tblLook")
+            look = OxmlElement("w:tblLook")
+            look.set(qn("w:val"), "0000")
+            for k, v in (("firstRow", "0"), ("lastRow", "0"),
+                         ("firstColumn", "0"), ("lastColumn", "0"),
+                         ("noHBand", "1"), ("noVBand", "1")):
+                look.set(qn("w:" + k), v)
+            tblPr.append(look)
+
         borders = OxmlElement("w:tblBorders")
         sides = ("top", "bottom", "left", "right", "insideH", "insideV")
         if style == "grid":
@@ -335,18 +415,21 @@ def style_tables(doc, settings) -> int:
             borders.append(el)
         tblPr.append(borders)
 
-        # 清掉旧单元格边框，避免原网格线在三线表/无线表里残留
-        for row in table.rows:
-            for cell in row.cells:
-                tcPr = cell._tc.find(qn("w:tcPr"))
+        # 直接按 XML tr/tc 遍历：比 row.cells 快 5~10 倍且不重复访问合并格
+        tr_lst = table._tbl.tr_lst
+        for tr in tr_lst:
+            for tc in tr.tc_lst:
+                tcPr = tc.find(w_tcPr)
                 if tcPr is not None:
                     _remove(tcPr, "tcBorders")
+                    if clear_shading:
+                        _remove(tcPr, "shd")
 
         # 三线表的栏目线（表头下线）：用较细的 inner（默认 0.75 磅）
         head_w = inner if inner > 0 else outer
-        if style == "three_line" and head_w > 0 and table.rows:
-            for cell in table.rows[0].cells:
-                tcPr = cell._tc.get_or_add_tcPr()
+        if style == "three_line" and head_w > 0 and tr_lst:
+            for tc in tr_lst[0].tc_lst:
+                tcPr = tc.get_or_add_tcPr()
                 tb = OxmlElement("w:tcBorders")
                 el = OxmlElement("w:bottom")
                 el.set(qn("w:val"), "single")
@@ -391,6 +474,7 @@ def apply_formats(doc, analysis, params: dict,
     except Exception:
         content_twips = 0.0
 
+    paras = doc.paragraphs
     stats: dict[str, int] = {}
     for d in analysis.detections:
         role = effective_role(d)
@@ -401,9 +485,10 @@ def apply_formats(doc, analysis, params: dict,
         ov = (overrides or {}).get(d.index)
         if ov:
             p.update({k: v for k, v in ov.items() if v is not None})
-        _apply_para(doc.paragraphs[d.index], p, role=role,
+        para = paras[d.index]
+        _apply_para(para, p, role=role,
                     label_bold=label_bold, indent_chars=indent_chars)
         if role == "equation":
-            _set_equation_tabs(doc.paragraphs[d.index], content_twips)
+            _set_equation_tabs(para, content_twips)
         stats[role] = stats.get(role, 0) + 1
     return stats

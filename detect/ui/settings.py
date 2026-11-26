@@ -246,11 +246,13 @@ class Settings:
     table_font_size: float = 10.5
     table_font: str = "宋体"
     table_ascii: str = "Times New Roman"
+    table_header_bold: bool = True
     table_bold: bool = False
     table_color: str = ""
-    # 表内文字对齐 / 表格在页面里的位置
+    # 表内文字对齐 / 表格在页面里的位置 / 清除原表底纹（去掉表头蓝底等填充色）
     table_align: str = "left"
     table_pos: str = "center"
+    table_clear_shading: bool = True
 
     # 图号 / 表号自定义
     caption_fig_prefix: str = "图"
@@ -356,13 +358,16 @@ class Settings:
                     "header_font", "header_ascii", "header_size", "header_bold",
                     "header_color", "header_gap",
                     "table_style", "table_line", "table_line_inner", "table_font_size",
-                    "table_font", "table_ascii", "table_bold", "table_color",
-                    "table_align", "table_pos",
+                    "table_font", "table_ascii", "table_header_bold", "table_bold",
+                    "table_color", "table_align", "table_pos",
                     "caption_fig_prefix", "caption_tab_prefix", "caption_sep",
                     "caption_by_chapter", "caption_start", "heading_sep",
                     "enable_marks", "bold_label", "caption_prefix_auto"):
             if key in data:
                 setattr(s, key, data[key])
+        # 兼容老版本方案：没有单独的 table_header_bold 时沿用原 table_bold
+        if "table_header_bold" not in data and "table_bold" in data:
+            s.table_header_bold = bool(data["table_bold"])
         return s
 
 

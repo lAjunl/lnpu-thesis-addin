@@ -34,10 +34,11 @@ def derive_cut_points(analysis) -> tuple[int | None, int | None]:
 
 
 def render_preview(source: Path, settings, out_path: Path,
-                   overrides: dict | None = None) -> tuple[int, int, int]:
+                   overrides: dict | None = None,
+                   analysis=None) -> tuple[int, int, int]:
     """返回 (排版段数, 编号数, 节数)。"""
     d = Document(str(source))
-    a = analyze(d, source=source.name)
+    a = analysis if analysis is not None else analyze(d, source=source.name)
 
     front = body = None
     if getattr(settings, "profile", "thesis") == "thesis":
@@ -47,6 +48,11 @@ def render_preview(source: Path, settings, out_path: Path,
         ):
             apply_sections(d, front_index=front, body_index=body,
                            plans=plans_from_settings(settings), settings=settings)
+        else:
+            from .sections import configure
+
+            configure(d, plans_from_settings(settings), settings,
+                      front_index=front, body_index=body)
     else:
         from .sections import configure
 

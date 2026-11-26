@@ -250,6 +250,14 @@ def _rel_blob(doc, rid: str | None) -> bytes | None:
         return None
 
 
+_W_DRAWING = qn("w:drawing")
+_W_PICT = qn("w:pict")
+_W_OBJ = qn("w:object")
+_A_BLIP = qn("a:blip")
+_R_EMBED = qn("r:embed")
+_W_T = qn("w:t")
+
+
 def element_images(doc, root_el) -> list[tuple[bytes, tuple[float, float] | None]]:
     """提取一个 XML 节点（段落或表格单元格）里的所有插图 (blob, 原始尺寸pt)。
 
@@ -258,18 +266,17 @@ def element_images(doc, root_el) -> list[tuple[bytes, tuple[float, float] | None
     - VML（w:pict → v:imagedata），老版 .doc 转 .docx 的封面校徽/插图多走这一路。
     跳过 w:object（MathType OLE 公式由公式通路画）和 mc:AlternateContent 里重复的 mc:Fallback。
     """
+    # 快速短路：绝大多数表格单元格/段落不含图片，C 层查找可省去 Python 递归遍历
+    if root_el.find(".//" + _W_DRAWING) is None and root_el.find(".//" + _W_PICT) is None:
+        return []
+
     from ..features import vml_size_pt
 
     out: list[tuple[bytes, tuple[float, float] | None]] = []
-    w_drawing = qn("w:drawing")
-    w_pict = qn("w:pict")
-    w_obj = qn("w:object")
-    a_blip = qn("a:blip")
-    r_embed = qn("r:embed")
 
     def walk(el) -> None:
         tag = el.tag
-        if tag == w_obj:
+        if tag == _W_OBJ:
             return
         if tag == _MC_ALT:
             choice = el.find(_MC_CHOICE)
@@ -280,14 +287,14 @@ def element_images(doc, root_el) -> list[tuple[bytes, tuple[float, float] | None
             if len(out) == before and fallback is not None:
                 walk(fallback)
             return
-        if tag == w_drawing:
+        if tag == _W_DRAWING:
             sz = _drawing_size(el)
-            for blip in el.iter(a_blip):
-                blob = _rel_blob(doc, blip.get(r_embed))
+            for blip in el.iter(_A_BLIP):
+                blob = _rel_blob(doc, blip.get(_R_EMBED))
                 if blob:
                     out.append((blob, sz))
             return
-        if tag == w_pict:
+        if tag == _W_PICT:
             for im in el.iter(_VML_IMG):
                 rid = im.get(_RID) or im.get(_O_RELID)
                 blob = _rel_blob(doc, rid)
@@ -722,7 +729,8 @@ def _frame_table(cur: QTextCursor, rows: list, cols: int, content_w: float,
                  line_pt: float, cjk: str, latin: str, size: float, bold: bool,
                  color: str, align: str, w: float, off: float,
                  border_pt: float = 0.0,
-                 cell_imgs: list | None = None) -> None:
+                 cell_imgs: list | None = None,
+                 first_row_bold: bool | None = None) -> None:
     """把一个表格包进无边框 frame 里，用 frame 的左右边距控制表格位置。"""
     col_w = w / max(1, cols)
     tf = QTextTableFormat()
@@ -749,10 +757,12 @@ def _frame_table(cur: QTextCursor, rows: list, cols: int, content_w: float,
     t = cur.insertTable(len(rows), cols, tf)
     img_max_w = max(20.0, col_w - 8.0)
     for r, texts in enumerate(rows):
+        row_bold = (first_row_bold if (r == 0 and first_row_bold is not None)
+                    else bold)
         for c in range(cols):
             cell = t.cellAt(r, c)
             cfmt = QTextTableCellFormat()
-            cfmt.setFont(_font(cjk, size, bold))
+            cfmt.setFont(_font(cjk, size, row_bold))
             cell.setFormat(cfmt)
             cc = cell.firstCursorPosition()
             bf = QTextBlockFormat()
@@ -760,7 +770,7 @@ def _frame_table(cur: QTextCursor, rows: list, cols: int, content_w: float,
             cc.setBlockFormat(bf)
             txt = texts[c] if c < len(texts) else ""
             if txt:
-                _insert_cell_text(cc, txt, cjk, latin, size, bold, color)
+                _insert_cell_text(cc, txt, cjk, latin, size, row_bold, color)
             if cell_imgs and r < len(cell_imgs) and c < len(cell_imgs[r]):
                 for blob, nat in cell_imgs[r][c]:
                     im = _load_image(blob, img_max_w, nat)
@@ -839,7 +849,9 @@ def _insert_table(doc, cur: QTextCursor, t_i: int, content_w: float,
                   bold: bool = False, color: str = "", align: str = "left",
                   pos: str = "center", width_pt: float | None = None,
                   style: str = "three_line",
-                  line_inner: float = 0.75) -> None:
+                  line_inner: float = 0.75,
+                  header_bold: bool | None = None,
+                  table=None) -> None:
     """预览表格：支持三线表（两粗一细）、网格表、无线表，并渲染单元格里的图片。
 
     三线表为什么拆分绘制：PySide6 的 QTextTableCellFormat 分边边框不绘制，
@@ -847,46 +859,52 @@ def _insert_table(doc, cur: QTextCursor, t_i: int, content_w: float,
     网格表直接用 QTextTableFormat.setBorder() 画全框线。
     表格位置（pos）靠外层 QTextFrame 的左右边距控制。
     """
-    try:
-        table = doc.tables[t_i]
-    except IndexError:
+    if table is None:
+        try:
+            table = doc.tables[t_i]
+        except IndexError:
+            return
+    tr_lst = table._tbl.tr_lst[:MAX_TABLE_ROWS]
+    if not tr_lst:
         return
-    rows = table.rows[:MAX_TABLE_ROWS]
-    if not rows:
-        return
-    cols = max(1, len(rows[0].cells))
+    # 直接按 XML tr/tc 读单元格文本与插图，避开 python-docx row.cells 网格展开的 O(R×C) 开销
+    row_tcs = [tr.tc_lst for tr in tr_lst]
+    cols = max(1, max(len(tcs) for tcs in row_tcs))
     w = max(20.0, min(float(width_pt or content_w), content_w))
     off = {"left": 0.0,
            "center": (content_w - w) / 2.0,
            "right": content_w - w}.get(pos, 0.0)
+    h_bold = bold if header_bold is None else bool(header_bold)
 
-    def row_text(r, c):
-        try:
-            return rows[r].cells[c].text.strip().replace("\n", " ")[:MAX_TABLE_CELL]
-        except Exception:
-            return ""
-
-    def row_imgs(r, c):
-        try:
-            return element_images(doc, rows[r].cells[c]._tc)
-        except Exception:
-            return []
-
-    all_texts = [[row_text(r, c) for c in range(cols)] for r in range(len(rows))]
-    all_imgs = [[row_imgs(r, c) for c in range(cols)] for r in range(len(rows))]
+    all_texts: list[list[str]] = []
+    all_imgs: list[list[list]] = []
+    for tcs in row_tcs:
+        r_txts: list[str] = []
+        r_imgs: list[list] = []
+        for tc in tcs:
+            txt = "".join(t.text or "" for t in tc.iter(_W_T)).strip().replace("\n", " ")[:MAX_TABLE_CELL]
+            r_txts.append(txt)
+            r_imgs.append(element_images(doc, tc))
+        while len(r_txts) < cols:
+            r_txts.append("")
+            r_imgs.append([])
+        all_texts.append(r_txts)
+        all_imgs.append(r_imgs)
 
     if style == "grid":
         bw = max(1.0, float(line_inner or line_pt or 1.0))
         _frame_table(cur, all_texts, cols, content_w, line_pt, cjk, latin,
                      size, bold, color, align, w, off,
-                     border_pt=bw, cell_imgs=all_imgs)
+                     border_pt=bw, cell_imgs=all_imgs,
+                     first_row_bold=h_bold)
         cur.insertBlock()
         return
 
     if style == "none":
         _frame_table(cur, all_texts, cols, content_w, 0.0, cjk, latin,
                      size, bold, color, align, w, off,
-                     border_pt=0.0, cell_imgs=all_imgs)
+                     border_pt=0.0, cell_imgs=all_imgs,
+                     first_row_bold=h_bold)
         cur.insertBlock()
         return
 
@@ -896,7 +914,7 @@ def _insert_table(doc, cur: QTextCursor, t_i: int, content_w: float,
     if outer > 0:
         _rule_block(cur, content_w, outer, w, off)        # 顶线（粗）
     _one_row_table(cur, all_texts[0], content_w, outer,
-                   cjk, latin, size, bold, color, align, w, off,
+                   cjk, latin, size, h_bold, color, align, w, off,
                    cell_imgs=all_imgs[0])
     if inner > 0:
         _rule_block(cur, content_w, inner, w, off)        # 栏目线（细）
@@ -941,6 +959,7 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
     tbl_latin = getattr(settings, "table_ascii", "") or FALLBACK_LATIN
     tbl_size = float(getattr(settings, "table_font_size", 10.5) or 10.5)
     tbl_bold = bool(getattr(settings, "table_bold", False))
+    tbl_header_bold = bool(getattr(settings, "table_header_bold", tbl_bold))
     tbl_color = getattr(settings, "table_color", "") or ""
     tbl_align = getattr(settings, "table_align", "left") or "left"
     tbl_pos = getattr(settings, "table_pos", "center") or "center"
@@ -950,6 +969,17 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
     td.setDocumentMargin(0)
     td.setDefaultFont(_font(FALLBACK_LATIN, 12, False))
 
+    # 一次性快照段落/表格与样式索引，避免循环内反复构建 python-docx 列表和扫 styles.xml
+    paras = doc.paragraphs
+    tables = doc.tables
+    style_idx = None
+    inspect_tbl = None
+    if side == "before" and tables:
+        from ..features import StyleIndex
+        from ..recognize import inspect_table_format
+        style_idx = StyleIndex(doc)
+        inspect_tbl = inspect_table_format
+
     cur = QTextCursor(td)
     block_of: dict[int, QTextBlock] = {}
     shown = 0
@@ -957,16 +987,34 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
 
     for kind, i in blocks_src:
         if kind == "tbl":
-            if shown_tbl < MAX_TABLES:
+            if shown_tbl < MAX_TABLES and i < len(tables):
+                tbl = tables[i]
                 if side == "before":
-                    st, ow, iw = _orig_table_style(doc.tables[i])
+                    st, ow, iw = _orig_table_style(tbl)
+                    orig = inspect_tbl(doc, [tbl], style_index=style_idx)
+                    _insert_table(
+                        doc, cur, i, content_w, ow,
+                        orig.get("font") or FALLBACK_CJK,
+                        orig.get("ascii") or FALLBACK_LATIN,
+                        float(orig.get("size") or 10.5),
+                        bool(orig.get("bold")), "",
+                        orig.get("align") or "left",
+                        orig.get("pos") or "center",
+                        table_width_pt(tbl, content_w),
+                        style=st, line_inner=iw,
+                        header_bold=bool(orig.get("header_bold")),
+                        table=tbl,
+                    )
                 else:
-                    st, ow, iw = tbl_style, table_outer, table_inner
-                _insert_table(doc, cur, i, content_w, ow,
-                              tbl_cjk, tbl_latin, tbl_size, tbl_bold, tbl_color,
-                              tbl_align, tbl_pos,
-                              table_width_pt(doc.tables[i], content_w),
-                              style=st, line_inner=iw)
+                    _insert_table(
+                        doc, cur, i, content_w, table_outer,
+                        tbl_cjk, tbl_latin, tbl_size, tbl_bold, tbl_color,
+                        tbl_align, tbl_pos,
+                        table_width_pt(tbl, content_w),
+                        style=tbl_style, line_inner=table_inner,
+                        header_bold=tbl_header_bold,
+                        table=tbl,
+                    )
                 shown_tbl += 1
             continue
 
@@ -1038,14 +1086,15 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
                     text = tab_plans[i] + clean_caption(text, aggressive=True)
 
         # ---- 公式：OMML 自绘 / MathType 走 EMF，按文档顺序全部渲染成图 ----
-        formula_ims = (_formula_images(doc.paragraphs[i], content_w, size,
+        para_obj = paras[i]
+        formula_ims = (_formula_images(para_obj, content_w, size,
                                        latin, bold)
                        if (f.has_math or f.has_ole) else [])
         standalone = bool(formula_ims) and _standalone_formula(
-            doc.paragraphs[i], f, len(formula_ims))
+            para_obj, f, len(formula_ims))
         if not formula_ims and f.has_math and side != "before":
             from ..features import _math_text
-            text = _math_text(doc.paragraphs[i]) or "（公式）"
+            text = _math_text(para_obj) or "（公式）"
 
         if formula_ims and not standalone:
             # 行内公式：文字和公式图按原文顺序铺在同一段里。
@@ -1056,7 +1105,7 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
             _insert_paragraph(cur, "", cjk, latin, size, bold, line_pt, align,
                               indent_pt, color, False, False, left_margin)
             block_of[i] = cur.block()
-            _insert_inline_formula(cur, doc.paragraphs[i], formula_ims,
+            _insert_inline_formula(cur, para_obj, formula_ims,
                                    cjk, latin, size, bold, color)
         else:
             _insert_paragraph(cur, text, cjk, latin, size, bold, line_pt, align,
@@ -1065,13 +1114,13 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
 
         if f.has_image:
             img_align = align if align in ("left", "center", "right") else "center"
-            for blob, nat in paragraph_images(doc, doc.paragraphs[i]):
+            for blob, nat in paragraph_images(doc, para_obj):
                 _insert_image(cur, blob, content_w, nat, img_align)
         elif formula_ims and standalone:
             # 显示公式 + 编号同一行（编号右对齐）
             from ..features import equation_label
             _insert_equation(cur, formula_ims,
-                             equation_label(doc.paragraphs[i]),
+                             equation_label(para_obj),
                              content_w, latin, size, bold, color)
         elif f.has_ole and not formula_ims and not text.strip():
             _insert_paragraph(cur, "（公式）", FALLBACK_CJK, FALLBACK_LATIN,

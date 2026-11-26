@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..classify import effective_role
-from .. import __version__
+from .. import __repo_url__, __version__
 
 
 FONTS = ["宋体", "黑体", "楷体", "仿宋", "Times New Roman"]
@@ -573,6 +573,15 @@ class AboutDialog(QDialog):
         ver.setObjectName("about-version")
         lay.addWidget(ver)
         lay.addWidget(QLabel("本地运行，文档不上传。"))
+        repo = QLabel(
+            f'GitHub 技术文档与更新：<br>'
+            f'<a href="{__repo_url__}" style="color:#0071e3;">{__repo_url__}</a>'
+        )
+        repo.setOpenExternalLinks(True)
+        repo.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        repo.setWordWrap(True)
+        self.repo_label = repo
+        lay.addWidget(repo)
         link = QPushButton("帮助文档")
         link.setFlat(True)
         link.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -656,9 +665,20 @@ class TableDialog(_BaseDialog):
         self.latin.setCurrentIndex(i if i >= 0 else 0)
         self.row("表内西文字体", self.latin)
 
-        self.bold = MarkCheck("表内加粗")
+        bold_wrap = QWidget(self)
+        bold_lay = QHBoxLayout(bold_wrap)
+        bold_lay.setContentsMargins(0, 0, 0, 0)
+        bold_lay.setSpacing(16)
+        self.header_bold = MarkCheck("表头加粗")
+        self.header_bold.setChecked(
+            bool(getattr(settings, "table_header_bold",
+                         getattr(settings, "table_bold", False))))
+        self.bold = MarkCheck("表体加粗")
         self.bold.setChecked(bool(getattr(settings, "table_bold", False)))
-        self.row("", self.bold)
+        bold_lay.addWidget(self.header_bold)
+        bold_lay.addWidget(self.bold)
+        bold_lay.addStretch(1)
+        self.row("加粗", bold_wrap)
 
         self.color = QComboBox()
         for key, text in COLOR_CHOICES:
@@ -682,6 +702,11 @@ class TableDialog(_BaseDialog):
         self.pos.setCurrentIndex(i if i >= 0 else 0)
         self.row("表格位置", self.pos)
 
+        self.clear_shading = MarkCheck("清除原表底纹（去掉表头/行背景填充色）")
+        self.clear_shading.setChecked(
+            bool(getattr(settings, "table_clear_shading", True)))
+        self.row("底纹", self.clear_shading)
+
         note = QLabel("三线表常用「两粗一细」：顶线/底线 1.5 磅，表头下方的栏目线 0.75 磅。")
         note.setObjectName("card-note")
         note.setWordWrap(True)
@@ -693,6 +718,7 @@ class TableDialog(_BaseDialog):
             w.currentIndexChanged.connect(lambda *_: self._refresh())
         for w in (self.line, self.line_inner, self.font_size):
             w.valueChanged.connect(lambda *_: self._refresh())
+        self.header_bold.toggled.connect(lambda *_: self._refresh())
         self.bold.toggled.connect(lambda *_: self._refresh())
         self.align.currentIndexChanged.connect(lambda *_: self._refresh())
         self.pos.currentIndexChanged.connect(lambda *_: self._refresh())
@@ -707,6 +733,7 @@ class TableDialog(_BaseDialog):
             "outer": self.line.value(),
             "inner": self.line_inner.value(),
             "size": self.font_size.value(),
+            "header_bold": self.header_bold.isChecked(),
             "bold": self.bold.isChecked(),
         }
         self.demo.update()
@@ -718,10 +745,12 @@ class TableDialog(_BaseDialog):
         settings.table_font_size = self.font_size.value()
         settings.table_font = self.font.currentText()
         settings.table_ascii = self.latin.currentText()
+        settings.table_header_bold = self.header_bold.isChecked()
         settings.table_bold = self.bold.isChecked()
         settings.table_color = self.color.currentData() or ""
         settings.table_align = self.align.currentData() or "left"
         settings.table_pos = self.pos.currentData() or "center"
+        settings.table_clear_shading = self.clear_shading.isChecked()
 
 
 class CaptionNumberDialog(_BaseDialog):

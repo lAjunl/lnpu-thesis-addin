@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, QTimer, QPoint, QPointF, QRectF
+from PySide6.QtCore import (QEvent, QEventLoop, Qt, QThread, QTimer,
+                              QPoint, QPointF, QRectF)
 from PySide6.QtGui import (QActionGroup, QBrush, QColor, QKeySequence,
                            QLinearGradient, QPainter, QPen, QShortcut)
 from PySide6.QtWidgets import (
@@ -203,6 +204,22 @@ class PageJump(QWidget):
         self._syncing = False
 
 
+class _FnWorker(QThread):
+    """在后台线程跑纯 python-docx 耗时任务，避免长文档卡死 Qt 主线程。"""
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+        self.result = None
+        self.error: Exception | None = None
+
+    def run(self) -> None:
+        try:
+            self.result = self._fn()
+        except Exception as exc:  # noqa: BLE001
+            self.error = exc
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -224,6 +241,11 @@ class MainWindow(QMainWindow):
         self.preview: WordPreview | None = None
         self.applied = False          # 是否已经排过版（缓存里有结果）
         self.cached_out: Path | None = None
+        self._applied_doc = None      # 最近一次一键排版的 Document（供格式检查用；self.doc 始终保持原稿干净）
+        self._doc_token = 0           # 每次打开新文档递增，供原稿侧预览缓存校验
+        self._before_cache = None     # (doc_token, content, td, blocks, page_count)
+        self._after_sig: str | None = None
+        self._busy = False
         self.overrides: dict = {}     # 段索引 → 手动格式（预览里点段落改的）
         self._jump: dict = {}         # 每个预览区的「跳至指定页」控件
         self.setAcceptDrops(True)    # 把 docx 拖进窗口直接打开
@@ -646,6 +668,55 @@ class MainWindow(QMainWindow):
             return
         self._after_change()
 
+    def _run_in_thread(self, fn, status_msg: str = ""):
+        """后台线程执行纯文档任务，主线程持续派发事件，防止长文档界面假死。"""
+        if status_msg:
+            self.statusBar().showMessage(status_msg)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._busy = True
+        btns = [b for b in (
+            getattr(self, "apply_btn", None),
+            getattr(self, "save_btn", None),
+            getattr(self, "compare_btn", None),
+            getattr(self, "detect_btn", None),
+            getattr(self, "detect_arrow", None),
+        ) if b is not None]
+        prev_en = [b.isEnabled() for b in btns]
+        for b in btns:
+            b.setEnabled(False)
+        QApplication.processEvents()
+        worker = _FnWorker(fn)
+        loop = QEventLoop(self)
+        # QueuedConnection 保证即使任务极快结束，quit 事件也必在 loop.exec() 中被消费，无竞态
+        worker.finished.connect(loop.quit, Qt.QueuedConnection)
+        worker.start()
+        loop.exec()
+        worker.wait()
+        for b, en in zip(btns, prev_en):
+            b.setEnabled(en)
+        self._busy = False
+        QApplication.restoreOverrideCursor()
+        if worker.error is not None:
+            raise worker.error
+        return worker.result
+
+    def _preview_sig(self) -> str:
+        """当前右侧预览依赖的完整状态指纹，用于判断一键排版后是否需要重复渲染。"""
+        import json
+
+        manual_roles = (
+            [(d.index, d.role, d.level) for d in self.analysis.detections
+             if getattr(d, "user_confirmed", False)]
+            if self.analysis is not None else []
+        )
+        payload = {
+            "tok": self._doc_token,
+            "s": self.settings.to_json(),
+            "ov": sorted((int(k), v) for k, v in self.overrides.items()),
+            "mr": manual_roles,
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
     def _after_change(self) -> None:
         """设置改动后：立刻刷新内嵌预览；如果 Word 对比开着，也刷新它。"""
         self.refresh_preview()
@@ -654,7 +725,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("内嵌预览与 Word 预览均已更新（原稿只读，未改动）")
 
     def refresh_preview(self) -> None:
-        """用 QTextDocument 分页渲染左右两栏。"""
+        """用 QTextDocument 分页渲染左右两栏。
+
+        原稿侧按 (doc_token, content) 缓存：调字体/表格/页眉/缩进或一键排版时
+        直接 0ms 复用，不再白白重绘左侧整篇原稿。
+        """
         if self.doc is None or self.analysis is None:
             return
         from ..preview_render import derive_cut_points
@@ -664,13 +739,21 @@ class MainWindow(QMainWindow):
         profile = getattr(self.settings, "profile", "thesis")
         _, body = derive_cut_points(self.analysis) if profile == "thesis" else (None, None)
 
-        before, b_blocks = render_side(self.doc, self.analysis, self.settings,
-                                       "before", content)
+        cache = self._before_cache
+        if cache is not None and cache[0] == self._doc_token and cache[1] == content:
+            _, _, before, b_blocks, nb = cache
+        else:
+            before, b_blocks = render_side(self.doc, self.analysis, self.settings,
+                                           "before", content)
+            nb = page_count(before)
+            self._before_cache = (self._doc_token, content, before, b_blocks, nb)
+
         after, a_blocks = render_side(self.doc, self.analysis, self.settings,
                                       "after", content, body_index=body,
                                       overrides=self.overrides)
+        na = page_count(after)
+        self._after_sig = self._preview_sig()
 
-        nb, na = page_count(before), page_count(after)
         nums = self.settings.enable_page_numbers
         b_labels = page_labels(before, b_blocks, body, content[1], nb,
                                profile=profile, show_numbers=nums)
@@ -858,7 +941,8 @@ class MainWindow(QMainWindow):
     def _render(self, out_path: Path) -> None:
         from ..preview_render import render_preview
 
-        render_preview(self.path, self.settings, out_path, overrides=self.overrides)
+        render_preview(self.path, self.settings, out_path,
+                       overrides=self.overrides, analysis=self.analysis)
 
     def open_file(self) -> None:
         from PySide6.QtWidgets import QFileDialog
@@ -871,6 +955,8 @@ class MainWindow(QMainWindow):
 
     def open_path(self, path: Path) -> bool:
         """打开指定路径的 docx/doc（按钮、命令行参数、拖拽共用）。"""
+        if self._busy:
+            return False
         suf = path.suffix.lower()
         if suf not in (".docx", ".doc"):
             QMessageBox.information(
@@ -880,11 +966,12 @@ class MainWindow(QMainWindow):
             return False
         self._orig_path = path
         if suf == ".doc":
-            self.statusBar().showMessage(f"正在转换旧版 .doc：{path.name} …")
-            QApplication.processEvents()
             try:
                 from ..features import ensure_docx
-                docx_path = ensure_docx(path)
+                docx_path = self._run_in_thread(
+                    lambda: ensure_docx(path),
+                    f"正在转换旧版 .doc：{path.name} …",
+                )
             except Exception as exc:  # noqa: BLE001
                 QMessageBox.critical(self, "转换 .doc 失败", str(exc))
                 return False
@@ -892,14 +979,24 @@ class MainWindow(QMainWindow):
         else:
             self.path = path
         try:
-            from docx import Document
+            def _load():
+                from docx import Document
 
-            self.doc = Document(str(self.path))
-            self.analysis = analyze(self.doc, source=path.name)
+                d = Document(str(self.path))
+                a = analyze(d, source=path.name)
+                return d, a
+
+            self.doc, self.analysis = self._run_in_thread(
+                _load, f"正在打开并分析 {path.name} …"
+            )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "打开失败", str(exc))
             return False
 
+        self._doc_token += 1
+        self._before_cache = None
+        self._after_sig = None
+        self._applied_doc = None
         self.applied = False
         self.cached_out = None
         self.save_btn.setEnabled(False)
@@ -908,7 +1005,13 @@ class MainWindow(QMainWindow):
         self.compare_btn.setEnabled(True)
         self.apply_btn.setEnabled(True)
         # 关键：打开后立刻渲染双栏预览，否则两栏是空的
-        self.refresh_preview()
+        self.statusBar().showMessage(f"正在生成双栏预览：{path.name} …")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            self.refresh_preview()
+        finally:
+            QApplication.restoreOverrideCursor()
 
         c = self.analysis.summary()["by_role"]
         heads = self.analysis.summary()["headings"]
@@ -1173,7 +1276,10 @@ class MainWindow(QMainWindow):
             return
         from ..check import check_document
 
-        findings = check_document(self.doc, self.analysis, self.settings)
+        target_doc = (self._applied_doc
+                      if (self.applied and self._applied_doc is not None)
+                      else self.doc)
+        findings = check_document(target_doc, self.analysis, self.settings)
         if not findings:
             QMessageBox.information(self, "格式检查", "✓ 未发现明显问题。")
             return
@@ -1182,30 +1288,17 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "格式检查", f"发现 {len(findings)} 条：\n\n{text}{more}")
 
     # ---------------------------------------------------------------- #
-    def _reload_source(self) -> None:
-        """重新读原稿，保证「一键排版」可以反复点（幂等）。"""
-        from docx import Document
-
-        self.doc = Document(str(self.path))
-        self.analysis = analyze(self.doc, source=self.path.name)
-
     def apply(self) -> None:
-        """一键排版：只生成结果并刷新预览，不弹保存框。
-
-        保存交给顶栏的「保存」按钮——用户自己决定覆盖原文件还是另存为。
+        """一键排版：在独立副本上执行排版并写入缓存，不改动内存里的原稿对象，
+        也不弹保存框——保存交给顶栏「保存」按钮。
         """
-        if self.doc is None or self.path is None:
+        if self._busy or self.doc is None or self.path is None:
             return
         from ..numbering import (
             apply_plans,
             plan_caption_numbers,
             plan_heading_numbers,
         )
-
-        # 已经排过一次的话，先从原稿重来，避免编号叠加
-        if getattr(self, "applied", False):
-            self._reload_source()
-
         from .preview import PreviewDialog
 
         front = body = None
@@ -1237,40 +1330,59 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("已取消")
             return
 
-        try:
-            from ..reflow import apply_formats
+        out_path = self._cache_dir() / "排版结果.docx"
+        src_path = self.path
+        analysis = self.analysis
+        settings = self.settings
+        overrides = dict(self.overrides)
+
+        def _do_apply():
+            from docx import Document
+            from ..reflow import apply_formats, indent_chars_of, style_tables
             from ..sections import apply as apply_sections
-            from ..sections import diagnose, plans_from_settings
+            from ..sections import configure, diagnose, plans_from_settings
 
-            if self.settings.profile == "thesis" and (
-                self.settings.enable_sections or self.settings.enable_page_numbers
+            work_doc = Document(str(src_path))
+            if settings.profile == "thesis" and (
+                settings.enable_sections or settings.enable_page_numbers
             ):
-                apply_sections(self.doc, front_index=front, body_index=body,
-                               plans=plans_from_settings(self.settings),
-                               settings=self.settings)
-            elif self.settings.profile == "journal":
+                apply_sections(work_doc, front_index=front, body_index=body,
+                               plans=plans_from_settings(settings),
+                               settings=settings)
+            elif settings.profile == "thesis":
+                configure(work_doc, plans_from_settings(settings),
+                          settings, front_index=front, body_index=body)
+            elif settings.profile == "journal":
                 # 期刊论文：不切分，只统一页码格式/页眉
-                from ..sections import configure
+                configure(work_doc, plans_from_settings(settings), settings)
 
-                configure(self.doc, plans_from_settings(self.settings), self.settings)
-            from ..reflow import indent_chars_of, style_tables
-
-            stats = apply_formats(self.doc, self.analysis, self.settings.roles,
-                                    overrides=self.overrides,
-                                    label_bold=bool(self.settings.bold_label),
-                                    indent_chars=indent_chars_of(self.settings))
-            style_tables(self.doc, self.settings)
-            if self.settings.enable_marks:
+            stats = apply_formats(work_doc, analysis, settings.roles,
+                                  overrides=overrides,
+                                  label_bold=bool(settings.bold_label),
+                                  indent_chars=indent_chars_of(settings))
+            style_tables(work_doc, settings)
+            if settings.enable_marks:
                 from ..marks import apply_marks
-                apply_marks(self.doc)
-            n_num = apply_plans(self.doc, plans) if plans else 0
-            self._write_cache()
+                apply_marks(work_doc)
+            n_num = apply_plans(work_doc, plans) if plans else 0
+            work_doc.save(str(out_path))
+            diag = diagnose(work_doc)
+            return work_doc, stats, n_num, diag
+
+        try:
+            work_doc, stats, n_num, diag = self._run_in_thread(
+                _do_apply, f"正在排版 {self.path.name} …"
+            )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "排版失败", str(exc))
             return
 
+        self._applied_doc = work_doc
+        self.cached_out = out_path
         self.applied = True
-        self.refresh_preview()
+        # 右侧预览已经与当前设置一致时无需重复整篇重绘
+        if self._after_sig != self._preview_sig():
+            self.refresh_preview()
         self.after_head.setText(f"排版后（{self.after_view.page_count()} 页）· 已排版")
         self.save_btn.setEnabled(True)
         stats_text = "、".join(
@@ -1278,7 +1390,7 @@ class MainWindow(QMainWindow):
         ) or "无"
         secs = " ｜ ".join(
             f"第{s['index']}节 {s['header'] or '无页眉'} {s['pgNumType_fmt'] or '无页码'}"
-            for s in diagnose(self.doc)["sections"]
+            for s in diag["sections"]
         )
         self.statusBar().showMessage(
             f"排版完成：{stats_text} ｜ 编号 {n_num} 个 ｜ {secs} ｜ "
@@ -1292,13 +1404,6 @@ class MainWindow(QMainWindow):
 
             self._cache = Path(tempfile.mkdtemp(prefix="thesis_out_"))
         return self._cache
-
-    def _write_cache(self) -> Path:
-        """把排版结果写到内部缓存文件，供预览对比与保存使用。"""
-        out = self._cache_dir() / "排版结果.docx"
-        self.doc.save(str(out))
-        self.cached_out = out
-        return out
 
     def save(self, mode: str) -> None:
         """用户明确点「保存」之后才落盘。mode = 'overwrite' | 'as'。"""

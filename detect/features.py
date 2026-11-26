@@ -87,6 +87,98 @@ def style_chain(style, max_depth: int = 12):
     return chain
 
 
+class StyleIndex:
+    """按文档一次性建立样式索引，避免 python-docx 每次读 p.style / tbl.style
+    线性扫描整个 styles.xml（含 default_for 的 O(N×S) 灾难）。
+    """
+
+    def __init__(self, doc: Document):
+        from docx.enum.style import WD_STYLE_TYPE
+
+        w_type = qn("w:type")
+        self.by_type_id: dict[tuple[str, str], Any] = {}
+        self.by_id: dict[str, Any] = {}
+        for st in doc.styles:
+            sid = st.style_id
+            if not sid:
+                continue
+            self.by_id[sid] = st
+            tp = st.element.get(w_type) or ""
+            if tp:
+                self.by_type_id[(tp, sid)] = st
+        try:
+            self.default_para = doc.styles.default(WD_STYLE_TYPE.PARAGRAPH)
+        except Exception:
+            self.default_para = None
+        try:
+            self.default_table = doc.styles.default(WD_STYLE_TYPE.TABLE)
+        except Exception:
+            self.default_table = None
+        self._chains: dict[str, list] = {}
+        self._w_pPr = qn("w:pPr")
+        self._w_pStyle = qn("w:pStyle")
+        self._w_tblPr = qn("w:tblPr")
+        self._w_tblStyle = qn("w:tblStyle")
+        self._w_basedOn = qn("w:basedOn")
+        self._w_val = qn("w:val")
+
+    def chain_of(self, style) -> list:
+        if style is None:
+            return []
+        key = (style.element.get(qn("w:type")) or "") + ":" + (style.style_id or str(id(style)))
+        cached = self._chains.get(key)
+        if cached is not None:
+            return cached
+        chain = []
+        cur = style
+        seen = set()
+        while cur is not None and len(chain) < 12:
+            ck = (cur.element.get(qn("w:type")) or "") + ":" + (cur.style_id or str(id(cur)))
+            if ck in seen:
+                break
+            seen.add(ck)
+            chain.append(cur)
+            bo = cur.element.find(self._w_basedOn)
+            next_id = bo.get(self._w_val) if bo is not None else None
+            if next_id:
+                tp = cur.element.get(qn("w:type")) or ""
+                cur = self.by_type_id.get((tp, next_id)) or self.by_id.get(next_id)
+            else:
+                cur = None
+        self._chains[key] = chain
+        return chain
+
+    def para_style(self, p: Paragraph):
+        pPr = p._p.find(self._w_pPr)
+        if pPr is not None:
+            ps = pPr.find(self._w_pStyle)
+            if ps is not None:
+                sid = ps.get(self._w_val)
+                if sid:
+                    st = self.by_type_id.get(("paragraph", sid)) or self.by_id.get(sid)
+                    if st is not None:
+                        return st
+        return self.default_para
+
+    def para_chain(self, p: Paragraph) -> list:
+        return self.chain_of(self.para_style(p))
+
+    def table_style(self, tbl):
+        tblPr = tbl._tbl.find(self._w_tblPr)
+        if tblPr is not None:
+            ts = tblPr.find(self._w_tblStyle)
+            if ts is not None:
+                sid = ts.get(self._w_val)
+                if sid:
+                    st = self.by_type_id.get(("table", sid)) or self.by_id.get(sid)
+                    if st is not None:
+                        return st
+        return self.default_table
+
+    def table_chain(self, tbl) -> list:
+        return self.chain_of(self.table_style(tbl))
+
+
 # ------------------------------------------------------------------ #
 # 特征
 # ------------------------------------------------------------------ #
@@ -501,7 +593,6 @@ RE_TOC = re.compile(r"^\s*(目\s*录|Contents)\b")
 
 
 def extract_features(doc: Document) -> list[ParaFeatures]:
-    styles = list(doc.styles)
     # docDefaults 在 styles.xml 里（不在 document.xml），层级是 docDefaults/rPrDefault/rPr。
     # 以前写成 doc.element.find(...) 永远取到 None —— 样式派生格式的稿子会大面积读空。
     defaults_rpr = None
@@ -519,13 +610,14 @@ def extract_features(doc: Document) -> list[ParaFeatures]:
         defaults_rpr = None
         defaults_pPr = None
 
-    cache: dict[int, list] = {}
+    si = StyleIndex(doc)
+    w_pPr = qn("w:pPr")
     out: list[ParaFeatures] = []
 
     for i, p in enumerate(doc.paragraphs):
-        style = p.style
-        chain = style_chain(style) if style is not None else []
-        pPr = p._p.find(qn("w:pPr"))
+        style = si.para_style(p)
+        chain = si.chain_of(style)
+        pPr = p._p.find(w_pPr)
 
         text = p.text.strip()
         f = ParaFeatures(
@@ -574,13 +666,17 @@ def extract_features(doc: Document) -> list[ParaFeatures]:
 
         out.append(f)
 
-    # 最近图片距离
-    img_idxs = [f.index for f in out if f.has_image]
+    # 最近图片距离（前后两次线性扫，O(N)）
+    last_img: int | None = None
     for f in out:
-        prev = next((x for x in reversed(img_idxs) if x < f.index), None)
-        nxt = next((x for x in img_idxs if x > f.index), None)
-        f.prev_image_idx = prev
-        f.next_image_idx = nxt
+        f.prev_image_idx = last_img
+        if f.has_image:
+            last_img = f.index
+    next_img: int | None = None
+    for f in reversed(out):
+        f.next_image_idx = next_img
+        if f.has_image:
+            next_img = f.index
 
     return out
 

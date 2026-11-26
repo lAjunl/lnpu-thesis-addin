@@ -90,6 +90,32 @@ def _scheme_summary(sc: schemes.Scheme) -> str:
         lines.append(f"表格：{tbl_st}")
     else:
         lines.append(f"表格：{tbl_st}（外/顶底 {outer:g} 磅 · 内/栏目 {inner:g} 磅）")
+    t_parts = [
+        f"{float(getattr(s, 'table_font_size', 10.5) or 10.5):g} 磅",
+        f"{getattr(s, 'table_font', '宋体') or '宋体'} / "
+        f"{getattr(s, 'table_ascii', 'Times New Roman') or 'Times New Roman'}",
+    ]
+    hb = bool(getattr(s, "table_header_bold", getattr(s, "table_bold", False)))
+    bb = bool(getattr(s, "table_bold", False))
+    if hb and bb:
+        t_parts.append("表头与表体加粗")
+    elif hb:
+        t_parts.append("表头加粗")
+    elif bb:
+        t_parts.append("表体加粗")
+    t_al = {"left": "左对齐", "center": "居中", "right": "右对齐",
+            "both": "两端对齐"}.get(getattr(s, "table_align", "left"), "")
+    if t_al:
+        t_parts.append(t_al)
+    lines.append("表内文字：" + " · ".join(t_parts))
+    htext = (getattr(s, "header_text", "") or "").strip()
+    if getattr(s, "enable_header", False) and htext:
+        h_size = float(getattr(s, "header_size", 10.5) or 10.5)
+        h_font = getattr(s, "header_font", "宋体") or "宋体"
+        h_asc = getattr(s, "header_ascii", "Times New Roman") or "Times New Roman"
+        lines.append(f"页眉：{htext}（{h_size:g} 磅 · {h_font} / {h_asc}）")
+    else:
+        lines.append("页眉：无")
     lines.append("")
     if sc.source:
         lines.append(f"来源：{sc.source}")
@@ -387,7 +413,7 @@ class DetectDialog(QDialog):
     def __init__(self, doc, analysis, base_settings=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("格式识别")
-        self.resize(920, 640)
+        self.resize(1080, 660)
         self.doc = doc
         self.analysis = analysis
         self.base = base_settings
@@ -433,15 +459,32 @@ class DetectDialog(QDialog):
             ["角色", "中文字体", "西文字体", "字号", "加粗", "行距", "对齐", "状态"])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(38)
-        # 按内容自适应：列宽不够时 Qt 会把组合框裁到看不见字
+        # 显式列宽：QComboBox 的 sizeHint 不含自定义 QSS 内边距，用 ResizeToContents 会裁字
         head = self.table.horizontalHeader()
         for i in range(7):
-            head.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+            head.setSectionResizeMode(i, QHeaderView.Interactive)
         head.setStretchLastSection(True)
-        for i, w in enumerate((104, 92, 150, 78, 52, 100, 92)):
+        for i, w in enumerate((176, 98, 174, 110, 140, 108, 106)):
             self.table.setColumnWidth(i, w)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         lay.addWidget(self.table, 1)
+
+        # ---- 页眉核对条（一眼可见是否识别到页眉，可随时开关/改字）----
+        hdr_bar = QHBoxLayout()
+        hdr_bar.setSpacing(10)
+        hdr_bar.addWidget(QLabel("页眉"))
+        self.hdr_enable = MarkCheck("启用页眉")
+        self.hdr_enable.setChecked(False)
+        hdr_bar.addWidget(self.hdr_enable)
+        self.hdr_text = QLineEdit()
+        self.hdr_text.setPlaceholderText("未检测到页眉（勾选左侧开关可手动填写）")
+        self.hdr_text.setEnabled(False)
+        hdr_bar.addWidget(self.hdr_text, 1)
+        self.hdr_status = QLabel("未识别（无页眉）")
+        self.hdr_status.setStyleSheet("color: #8a8f98;")
+        hdr_bar.addWidget(self.hdr_status)
+        self.hdr_enable.toggled.connect(self.hdr_text.setEnabled)
+        lay.addLayout(hdr_bar)
 
         # ---- 保存为方案 ----
         save = QHBoxLayout()
@@ -477,6 +520,7 @@ class DetectDialog(QDialog):
         lay.addWidget(box)
 
         self._cells: dict[str, list] = {}
+        self._tbl_cells: dict | None = None
 
     # ---------------------------------------------------------------- #
     def _pick(self) -> None:
@@ -520,8 +564,9 @@ class DetectDialog(QDialog):
 
     def _fill_table(self) -> None:
         roles = [r for r in DETECT_ROLES if r in self.report.get("roles", {})]
-        self.table.setRowCount(len(roles))
+        self.table.setRowCount(len(roles) + 1)
         self._cells = {}
+        self._tbl_cells = None
         for row, role in enumerate(roles):
             attrs = self.report["roles"][role]
             base = (self.base.roles.get(role) if self.base else {}) or {}
@@ -582,6 +627,109 @@ class DetectDialog(QDialog):
 
             self._cells[role] = [cb, cl, sz, bold, lc, al]
 
+        # ---- 末尾补一行：表格内文字（含表头/表体独立加粗）----
+        tbl_row = len(roles)
+        tbl = self.report.get("table") or {}
+        self.table.setItem(tbl_row, 0, QTableWidgetItem("表格内文字"))
+
+        t_cb = QComboBox()
+        t_cb.addItems(FONTS)
+        t_cb.setEditable(True)
+        t_cb.setCurrentText(
+            tbl.get("font") or getattr(self.base, "table_font", "宋体") or "宋体")
+        t_cb.lineEdit().setCursorPosition(0)
+        self.table.setCellWidget(tbl_row, 1, t_cb)
+
+        t_cl = QComboBox()
+        t_cl.addItems(LATIN_FONTS)
+        t_cl.setEditable(True)
+        t_cl.setCurrentText(
+            tbl.get("ascii") or getattr(self.base, "table_ascii", "Times New Roman")
+            or "Times New Roman")
+        t_cl.lineEdit().setCursorPosition(0)
+        self.table.setCellWidget(tbl_row, 2, t_cl)
+
+        t_sz = QDoubleSpinBox()
+        t_sz.setRange(4, 72)
+        t_sz.setDecimals(1)
+        t_sz.setSingleStep(0.5)
+        t_sz.setValue(float(
+            tbl.get("size") if tbl.get("size") is not None
+            else getattr(self.base, "table_font_size", 10.5) or 10.5))
+        self.table.setCellWidget(tbl_row, 3, t_sz)
+
+        b_wrap = QWidget()
+        b_lay = QHBoxLayout(b_wrap)
+        b_lay.setContentsMargins(4, 0, 4, 0)
+        b_lay.setSpacing(8)
+        t_hbold = MarkCheck("表头")
+        t_hbold.setToolTip("表头（首行）加粗")
+        t_hbold.setChecked(
+            bool(tbl["header_bold"]) if tbl.get("header_bold") is not None
+            else bool(getattr(self.base, "table_header_bold",
+                              getattr(self.base, "table_bold", True))))
+        t_bbold = MarkCheck("表体")
+        t_bbold.setToolTip("表体（数据行）加粗")
+        t_bbold.setChecked(
+            bool(tbl["bold"]) if tbl.get("bold") is not None
+            else bool(getattr(self.base, "table_bold", False)))
+        b_lay.addWidget(t_hbold)
+        b_lay.addWidget(t_bbold)
+        b_lay.addStretch(1)
+        self.table.setCellWidget(tbl_row, 4, b_wrap)
+
+        dash = QTableWidgetItem("—")
+        dash.setTextAlignment(Qt.AlignCenter)
+        dash.setForeground(Qt.GlobalColor.gray)
+        self.table.setItem(tbl_row, 5, dash)
+
+        t_al = QComboBox()
+        for key, text in ALIGNS:
+            t_al.addItem(text, key)
+        idx = t_al.findData(
+            tbl.get("align") or getattr(self.base, "table_align", "left") or "left")
+        t_al.setCurrentIndex(idx if idx >= 0 else 0)
+        self.table.setCellWidget(tbl_row, 6, t_al)
+
+        tbl_detected = any(tbl.get(k) is not None for k in (
+            "font", "ascii", "size", "header_bold", "bold", "align"))
+        t_st = QTableWidgetItem("未识别" if not tbl_detected else "实测")
+        if not tbl_detected:
+            t_st.setForeground(Qt.GlobalColor.gray)
+            for w in (t_cb, t_cl, t_sz, t_hbold, t_bbold, t_al):
+                w.setStyleSheet("color: #8a8f98;")
+        self.table.setItem(tbl_row, 7, t_st)
+
+        self._tbl_cells = {
+            "font": t_cb,
+            "ascii": t_cl,
+            "size": t_sz,
+            "header_bold": t_hbold,
+            "bold": t_bbold,
+            "align": t_al,
+        }
+
+        # ---- 填充页眉核对条 ----
+        hdr = self.report.get("header") or {}
+        has_hdr = bool(hdr.get("enabled") and (hdr.get("text") or "").strip())
+        self.hdr_enable.setChecked(has_hdr)
+        self.hdr_text.setEnabled(has_hdr)
+        self.hdr_text.setText((hdr.get("text") or "").strip() if has_hdr else "")
+        if has_hdr:
+            info = []
+            if hdr.get("font"):
+                info.append(hdr["font"])
+            if hdr.get("size") is not None:
+                info.append(f"{float(hdr['size']):g} 磅")
+            if hdr.get("line") is not None:
+                info.append("无横线" if float(hdr["line"]) <= 0 else f"横线 {float(hdr['line']):g} 磅")
+            suffix = (" · " + " / ".join(info)) if info else ""
+            self.hdr_status.setText("实测" + suffix)
+            self.hdr_status.setStyleSheet("")
+        else:
+            self.hdr_status.setText("未识别（无页眉）")
+            self.hdr_status.setStyleSheet("color: #8a8f98;")
+
     def _collect(self) -> dict:
         """把（可能被改过的）核对表读回报告。"""
         roles = self.report.setdefault("roles", {})
@@ -607,6 +755,22 @@ class DetectDialog(QDialog):
             else:
                 attrs["line"] = ("exact", prev_val or round(size * 1.4, 1))
             attrs["align"] = al.currentData() or "left"
+        if self._tbl_cells:
+            tbl = self.report.setdefault("table", {})
+            tbl["font"] = self._tbl_cells["font"].currentText().strip()
+            tbl["ascii"] = self._tbl_cells["ascii"].currentText().strip()
+            tbl["size"] = float(self._tbl_cells["size"].value())
+            tbl["header_bold"] = bool(self._tbl_cells["header_bold"].isChecked())
+            tbl["bold"] = bool(self._tbl_cells["bold"].isChecked())
+            tbl["align"] = self._tbl_cells["align"].currentData() or "left"
+        htext = self.hdr_text.text().strip()
+        h_on = bool(self.hdr_enable.isChecked() and htext)
+        hdr = self.report.setdefault("header", {})
+        hdr["enabled"] = h_on
+        hdr["text"] = htext if h_on else ""
+        page = self.report.setdefault("page", {})
+        page["enable_header"] = h_on
+        page["header_text"] = htext if h_on else ""
         return self.report
 
     def _save_scheme(self) -> None:
