@@ -170,34 +170,47 @@ def indent_chars_of(settings) -> float:
 
 
 def _bold_leading_label(para, base_bold: bool = False) -> bool:
-    """把段落开头的 "Abstract:" / "关键词:" 标签加粗，正文部分不动。
+    """把段落开头的 "Abstract:" / "摘要：" / "Keywords:" / "关键词：" 标签加粗，正文部分不动。
 
-    只加粗标签这几个字（期刊习惯），所以要把第一个 run 拆成两段。
+    支持标签跨多个 run（Word 常把 "Abstract" 和 ": " 拆成两个 run），
+    也支持标签和正文混在同一个 run 内（按字符边界切开）。
     """
+    import copy
+    from docx.text.run import Run
     from .labels import split_label
 
-    runs = para.runs
+    runs = list(para.runs)
     if not runs:
         return False
-    label, _ = split_label("".join(r.text for r in runs))
+    full = "".join(r.text for r in runs)
+    label, _ = split_label(full)
     if label is None:
         return False
-    r0 = runs[0]
-    if not r0.text.startswith(label):
-        return False            # 标签跨 run，极少见，退化为不做
-    import copy
 
-    leftover = r0.text[len(label):]
-    r0.text = label
-    r0.font.bold = True
-    if leftover:
-        new_r = copy.deepcopy(r0._r)
-        r0._r.addnext(new_r)
-        from docx.text.run import Run
-
-        nr = Run(new_r, para)
-        nr.text = leftover
-        nr.font.bold = base_bold
+    need = len(label)
+    pos = 0
+    for r in runs:
+        t = r.text
+        n = len(t)
+        if not n:
+            continue
+        if pos + n <= need:
+            _set_explicit_bold(r._r.get_or_add_rPr(), True)
+            pos += n
+            if pos >= need:
+                break
+        else:
+            cut = need - pos
+            head, tail = t[:cut], t[cut:]
+            if tail:
+                new_r = copy.deepcopy(r._r)
+                r._r.addnext(new_r)
+                nr = Run(new_r, para)
+                nr.text = tail
+                _set_explicit_bold(nr._r.get_or_add_rPr(), base_bold)
+            r.text = head
+            _set_explicit_bold(r._r.get_or_add_rPr(), True)
+            break
     return True
 
 
@@ -208,6 +221,8 @@ def _apply_para(para, p: dict, role: str | None = None,
     indent_chars: 正文段落的首行缩进字符数。None = 不处理，0 = 顶格（清掉缩进）。
     只作用于 body：其它角色（尤其参考文献的悬挂缩进）不能被改。
     """
+    from .labels import split_label as _split_label
+
     pf = para.paragraph_format
     _set_line_spacing(para, p)
     align = ALIGN_MAP.get(p.get("align", "left"))
@@ -217,6 +232,13 @@ def _apply_para(para, p: dict, role: str | None = None,
         _set_first_indent(para, indent_chars,
                           float(p.get("size", 12) or 12))
 
+    # 摘要 / 关键词「标签 + 内容」同行段落（如 "摘要：..." / "Keywords: ..."）：
+    # 即使角色勾选了加粗或开启了 label_bold，也只加粗开头标签，后面的正文/关键词绝不加粗
+    inline_label = (role in LABEL_ROLES
+                    and _split_label(para.text or "")[0] is not None)
+    want_label_bold = inline_label and (label_bold or bool(p.get("bold")))
+    body_bold = False if inline_label else bool(p.get("bold"))
+
     # 字色：留空表示"不指定"（沿用 Word 的自动色），写 w:color 会覆盖掉
     color = (p.get("color") or "").strip()
 
@@ -224,7 +246,6 @@ def _apply_para(para, p: dict, role: str | None = None,
         cjk = p.get("font") or "宋体"
         latin = p.get("ascii") or cjk
         size = float(p["size"])
-        bold = bool(p.get("bold"))
         # 一次遍历**所有** w:r（含超链接 / 域 / sdt 内部的）。
         # 不能用 paragraph.runs + id() 去重：lxml 的元素代理每次访问都是新对象，
         # id() 不可靠；而超链接里的 run 本来就不在 paragraph.runs 里，
@@ -234,16 +255,18 @@ def _apply_para(para, p: dict, role: str | None = None,
             va = rPr.find(qn("w:vertAlign"))
             script = va is not None and va.get(qn("w:val")) in ("superscript",
                                                                 "subscript")
-            _set_rpr_font(rPr, cjk, latin, size, bold, family_only=script)
+            _set_rpr_font(rPr, cjk, latin, size, body_bold, family_only=script)
+            if inline_label and not script:
+                _set_explicit_bold(rPr, False)
             for el in rPr.findall(qn("w:color")):
                 rPr.remove(el)
             if color:
                 rPr.get_or_add_color().set(qn("w:val"), color.replace("#", ""))
     else:
-        _set_para_default_font(para, p)
+        _set_para_default_font(para, {**p, "bold": body_bold})
 
-    if label_bold and role in LABEL_ROLES:
-        _bold_leading_label(para, bool(p.get("bold")))
+    if want_label_bold:
+        _bold_leading_label(para, base_bold=False)
 
 
 def _table_fonts(settings) -> tuple[str, str, float, bool, bool, str]:

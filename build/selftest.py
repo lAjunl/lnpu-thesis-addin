@@ -1376,6 +1376,100 @@ def main() -> int:
           f"data={_pdlg.role.currentData()!r} text={_pdlg.role.currentText()!r}")
     _pdlg.close()
 
+    # ---- OMML 公式数组 eqArr / 空矩阵 / fName 防闪退回归 ----
+    from lxml import etree as _etree
+    from detect.omml import render_element as _render_omml
+    _MNS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+    _eq_xml = (
+        f'<m:oMath xmlns:m="{_MNS}">'
+        '<m:eqArr><m:e><m:r><m:t>a=1</m:t></m:r></m:e>'
+        '<m:e><m:r><m:t>b=2</m:t></m:r></m:e></m:eqArr>'
+        '<m:r><m:t>)</m:t></m:r></m:oMath>'
+    )
+    _eq_im = _render_omml(_etree.fromstring(_eq_xml), 10.5, "Times New Roman", False)
+    check("OMML eqArr（含 m:e 子项）正常渲染不闪退",
+          _eq_im is not None and _eq_im.width() > 0 and _eq_im.height() > 0,
+          f"im={_eq_im.width() if _eq_im else None}x{_eq_im.height() if _eq_im else None}")
+
+    _empty_eq_xml = (
+        f'<m:oMath xmlns:m="{_MNS}"><m:eqArr/><m:r><m:t>)</m:t></m:r></m:oMath>'
+    )
+    _empty_eq_im = _render_omml(_etree.fromstring(_empty_eq_xml), 10.5, "Times New Roman", False)
+    check("OMML 空 eqArr 搭配 m:r 不触发 Qt SIGABRT",
+          _empty_eq_im is not None and _empty_eq_im.width() > 0,
+          f"im={_empty_eq_im}")
+
+    _empty_mat_xml = (
+        f'<m:oMath xmlns:m="{_MNS}"><m:m><m:mr/></m:m><m:r><m:t>x</m:t></m:r></m:oMath>'
+    )
+    _empty_mat_im = _render_omml(_etree.fromstring(_empty_mat_xml), 10.5, "Times New Roman", False)
+    check("OMML 空行矩阵搭配 m:r 不抛错不闪退",
+          _empty_mat_im is not None and _empty_mat_im.width() > 0,
+          f"im={_empty_mat_im}")
+
+    _func_xml = (
+        f'<m:oMath xmlns:m="{_MNS}"><m:func>'
+        '<m:fName><m:r><m:t>sin</m:t></m:r></m:fName>'
+        '<m:e><m:r><m:t>x</m:t></m:r></m:e></m:func></m:oMath>'
+    )
+    _func_im = _render_omml(_etree.fromstring(_func_xml), 10.5, "Times New Roman", False)
+    check("OMML func(m:fName) 正常测量与渲染",
+          _func_im is not None and _func_im.width() > 0,
+          f"im={_func_im.width() if _func_im else None}")
+
+    # ---- 摘要/关键词仅标签加粗（前缀识别不误判整段、跨 run 拆分、不加粗正文与关键词本体）----
+    from detect.recognize import recognize_from_doc as _rec_doc
+    from detect.reflow import apply_formats as _apply_fmts
+    _ak_doc = Document()
+    _p_abs = _ak_doc.add_paragraph()
+    _r1 = _p_abs.add_run("摘要"); _r1.bold = True
+    _r2 = _p_abs.add_run("："); _r2.bold = True
+    _p_abs.add_run("本文系统研究了深海柔性立管在热力耦合作用下的力学行为与蠕变特性。")
+    _p_kw = _ak_doc.add_paragraph()
+    _rk = _p_kw.add_run("关键词："); _rk.bold = True
+    _p_kw.add_run("柔性立管；热力耦合；蠕变；数值模拟")
+    _p_en_abs = _ak_doc.add_paragraph()
+    _re1 = _p_en_abs.add_run("Abstract"); _re1.bold = True
+    _re2 = _p_en_abs.add_run(": "); _re2.bold = True
+    _p_en_abs.add_run("This paper investigates the thermo-mechanical coupling behavior.")
+    _p_en_kw = _ak_doc.add_paragraph()
+    _rek = _p_en_kw.add_run("Keywords: "); _rek.bold = True
+    _p_en_kw.add_run("flexible riser; coupling; creep")
+    _ak_ana = analyze(_ak_doc, "ak.docx")
+    _ak_rec = _rec_doc(_ak_doc, _ak_ana)
+    check("摘要/关键词仅前缀加粗时，格式识别不误判为整段加粗",
+          _ak_rec.roles["abstract"]["bold"] is False and _ak_rec.roles["keywords"]["bold"] is False,
+          f"abs={_ak_rec.roles['abstract']['bold']} kw={_ak_rec.roles['keywords']['bold']}")
+
+    _ak_s = Settings()
+    _ak_s.roles["abstract"]["bold"] = True
+    _ak_s.roles["keywords"]["bold"] = True
+    _apply_fmts(_ak_doc, _ak_ana, _ak_s.roles, label_bold=True)
+    _abs_runs = [(r.text, r.bold) for r in _ak_doc.paragraphs[0].runs if r.text]
+    _kw_runs = [(r.text, r.bold) for r in _ak_doc.paragraphs[1].runs if r.text]
+    _eabs_runs = [(r.text, r.bold) for r in _ak_doc.paragraphs[2].runs if r.text]
+    _ekw_runs = [(r.text, r.bold) for r in _ak_doc.paragraphs[3].runs if r.text]
+    check("摘要/关键词同行段落即使角色勾选加粗也只加粗中英文标签、不加粗正文与关键词",
+          _abs_runs[-1][1] is False and _abs_runs[0][1] is True
+          and _kw_runs[-1][1] is False and _kw_runs[0][1] is True
+          and _eabs_runs[-1][1] is False and _eabs_runs[0][1] is True and _eabs_runs[1][1] is True
+          and _ekw_runs[-1][1] is False and _ekw_runs[0][1] is True,
+          f"abs={_abs_runs} kw={_kw_runs} eabs={_eabs_runs} ekw={_ekw_runs}")
+
+    # 预览侧同步验证：同行摘要/关键词只加粗标签，后面正文 charFormat.fontWeight 非加粗
+    _ak_qdoc, _ = render_side(_ak_doc, _ak_ana, _ak_s, "after", (415.0, 680.0))
+    _b0 = _ak_qdoc.findBlockByNumber(0)
+    _frags0 = []
+    _it = _b0.begin()
+    while not _it.atEnd():
+        _fr = _it.fragment()
+        if _fr.isValid():
+            _frags0.append((_fr.text(), _fr.charFormat().fontWeight() >= 700))
+        _it += 1
+    check("预览渲染同行摘要只加粗标签、正文不加粗",
+          len(_frags0) >= 2 and _frags0[0][1] is True and _frags0[-1][1] is False,
+          repr(_frags0))
+
     print("\n" + ("全部通过" if not FAIL else f"失败 {len(FAIL)} 项: {FAIL}"))
     win.close()
     return 1 if FAIL else 0

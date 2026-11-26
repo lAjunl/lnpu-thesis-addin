@@ -1227,11 +1227,17 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
                 color = p.get("color") or ""
                 align = p.get("align", "left")
                 from ..reflow import indent_chars_of
+                from ..labels import split_label as _split_label
                 indent_pt = (indent_chars_of(settings) * size
                              if role == "body" else 0.0)
-                label_bold = bool(getattr(settings, "bold_label", False)) \
-                    and role in LABEL_ROLES
                 text = f.text
+                inline_label = (role in LABEL_ROLES
+                                and _split_label(text)[0] is not None)
+                if inline_label:
+                    label_bold = bool(getattr(settings, "bold_label", False)) or bold
+                    bold = False
+                else:
+                    label_bold = False
                 if i in head_plans:
                     text = head_plans[i] + clean_heading(text)
                 elif i in fig_plans:

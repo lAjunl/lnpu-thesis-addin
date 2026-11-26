@@ -292,22 +292,39 @@ def _size_pt(p: Paragraph, pPr, chain, doc_defaults_rpr) -> float | None:
 
 
 def _bold_of(p: Paragraph, pPr, chain, doc_defaults_rpr=None) -> bool | None:
-    for r_el, txt in _visible_runs(p):
-        if not txt.strip():
-            continue
-        b = _find_in_pPr(_rpr_of(r_el), "b")
-        if b is not None:
-            v = _get_w(b, "val")
-            return True if v is None else v not in ("0", "false", "off")
+    inherited: bool | None = None
     for el in (_rpr_of(pPr), *[_style_rPr(st) for st in chain],
                doc_defaults_rpr):
         b = _find_in_pPr(el, "b")
         if b is not None:
             v = _get_w(b, "val")
-            if v is None:
-                return True
-            return v not in ("0", "false", "off")
-    return None
+            inherited = True if v is None else v not in ("0", "false", "off")
+            break
+
+    # 按非空字符数加权判定整段是否加粗：避免仅开头标签加粗
+    # （如 "摘要：..." / "Keywords: ..."）被误判为整段加粗
+    bold_chars = 0
+    total_chars = 0
+    any_explicit = False
+    for r_el, txt in _visible_runs(p):
+        s = txt.strip()
+        if not s:
+            continue
+        n = len(s)
+        total_chars += n
+        b = _find_in_pPr(_rpr_of(r_el), "b")
+        if b is not None:
+            any_explicit = True
+            v = _get_w(b, "val")
+            is_b = True if v is None else v not in ("0", "false", "off")
+        else:
+            is_b = bool(inherited)
+        if is_b:
+            bold_chars += n
+
+    if total_chars > 0 and any_explicit:
+        return bold_chars > total_chars / 2.0
+    return inherited
 
 
 def _east_asia_of(p: Paragraph, pPr, chain, doc_defaults_rpr=None) -> str:

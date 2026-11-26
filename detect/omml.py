@@ -274,8 +274,10 @@ def _matrix_box(el, size, latin, bold) -> Box:
     rows = _kids(el, "mr")
     cells = []                      # 每格存 (元素, 尺寸)，绘制时要按元素递归
     for r in rows:
-        cells.append([(e, measure(e, size, latin, bold))
-                      for e in _kids(r, "e")])
+        row_cells = [(e, measure(e, size, latin, bold))
+                     for e in _kids(r, "e")]
+        if row_cells:
+            cells.append(row_cells)
     if not cells:
         return Box(0.0, size, size * 0.8)
     ncols = max(len(r) for r in cells)
@@ -337,17 +339,19 @@ def _bar_box(el, size, latin, bold) -> Box:
 
 def _func_box(el, size, latin, bold) -> Box:
     eb = measure(_kid(el, "e"), size, latin, bold)
-    fn = measure(_kid(el, "funcName"), size, latin, bold)
+    fn_el = _kid(el, "fName")
+    if fn_el is None:
+        fn_el = _kid(el, "funcName")
+    fn = measure(fn_el, size, latin, bold)
     gap = size * 0.10
     b = Box(fn.w + gap + eb.w, max(eb.h, fn.h), max(eb.base, fn.base))
-    b._func = (eb, fn, gap)   # type: ignore
+    b._func = (eb, fn, fn_el, gap)   # type: ignore
     return b
 
 
 def _eqarr_box(el, size, latin, bold) -> Box:
-    rows = []
-    for mr in _kids(el, "mr"):
-        rows.append(_seq_box(mr, size, latin, bold))
+    row_els = _kids(el, "e") or _kids(el, "mr")
+    rows = [_seq_box(r, size, latin, bold) for r in row_els]
     if not rows:
         return Box(0.0, size, size * 0.8)
     gap = size * 0.14
@@ -355,7 +359,7 @@ def _eqarr_box(el, size, latin, bold) -> Box:
     h = sum(r.h for r in rows) + gap * (len(rows) - 1)
     base = rows[0].base
     b = Box(w, h, base)
-    b._eqarr = (rows, gap)   # type: ignore
+    b._eqarr = (row_els, rows, gap)   # type: ignore
     return b
 
 
@@ -514,7 +518,10 @@ def _draw_delim(p, el, x, base, size, latin, bold):
 
 def _draw_matrix(p, el, x, base, size, latin, bold):
     b = measure(el, size, latin, bold)
-    cells, colw, gapx, gapy, rowb = b._mat   # type: ignore
+    mat = getattr(b, "_mat", None)
+    if not mat:
+        return
+    cells, colw, gapx, gapy, rowb = mat
     cy = base - rowb[0]
     for r, row in enumerate(cells):
         if r:
@@ -556,18 +563,21 @@ def _draw_bar(p, el, x, base, size, latin, bold):
 
 def _draw_func(p, el, x, base, size, latin, bold):
     b = measure(el, size, latin, bold)
-    eb, fn, gap = b._func   # type: ignore
-    draw(p, _kid(el, "funcName"), x, base, size, latin, bold)
+    eb, fn, fn_el, gap = b._func   # type: ignore
+    draw(p, fn_el, x, base, size, latin, bold)
     draw(p, _kid(el, "e"), x + fn.w + gap, base, size, latin, bold)
 
 
 def _draw_eqarr(p, el, x, base, size, latin, bold):
     b = measure(el, size, latin, bold)
-    rows, gap = b._eqarr   # type: ignore
+    eq = getattr(b, "_eqarr", None)
+    if not eq:
+        return
+    row_els, rows, gap = eq
     top = base - rows[0].base
     for r, rb in enumerate(rows):
         cy = top + sum(rr.h for rr in rows[:r]) + gap * r
-        draw(p, _kids(el, "mr")[r], x, cy + rb.base, size, latin, bold)
+        draw(p, row_els[r], x, cy + rb.base, size, latin, bold)
 
 
 def _draw_groupchr(p, el, x, base, size, latin, bold):
@@ -604,15 +614,21 @@ def render_element(el, size: float, latin: str = "Times New Roman",
     box = measure(el, size, latin, bold)
     if box.w <= 0 or box.h <= 0:
         return None
-    w = max(1, int(math.ceil(box.w * scale)))
-    h = max(1, int(math.ceil(box.h * scale)))
+    w = max(1, min(16384, int(math.ceil(box.w * scale))))
+    h = max(1, min(16384, int(math.ceil(box.h * scale))))
     im = QImage(w, h, QImage.Format.Format_ARGB32)
+    if im.isNull():
+        return None
     im.fill(0)                      # 透明底
     pt = QPainter(im)
-    pt.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pt.scale(scale, scale)
-    draw(pt, el, 0.0, box.base, size, latin, bold)
-    pt.end()
+    if not pt.isActive():
+        return None
+    try:
+        pt.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pt.scale(scale, scale)
+        draw(pt, el, 0.0, box.base, size, latin, bold)
+    finally:
+        pt.end()
     im.setDevicePixelRatio(scale)
     return im
 

@@ -9,8 +9,7 @@ import re
 
 # 注意顺序：长写法在前，避免 "Abstract:" 被 "Abstract" 截断后退成不匹配
 RE_LABEL = re.compile(
-    r"^\s*(Abstract|ABSTRACT|Abstract\s*[:：]|摘要\s*[:：]?|"
-    r"Keywords?|KEYWORDS?|关键词)\s*[:：]?\s*",
+    r"^\s*(?:Abstract|摘\s*要|Key\s*words?|关\s*键\s*词)\s*[:：]?\s*",
     re.I,
 )
 
@@ -21,13 +20,14 @@ LABEL_ROLES = ("abstract", "keywords")
 def split_label(text: str):
     """返回 (标签, 其余)。不是标签开头就返回 (None, text)。
 
-    标签必须短于整段，否则整段就是一个词（比如标题本身就叫 "Abstract"），
-    那时没有"其余"部分，加粗整个词没有意义。
+    标签必须短于整段且后面有正文内容，否则整段就是一个标题词
+    （比如独占一行的 "Abstract" / "摘要"），那时没有"其余"部分。
     """
     m = RE_LABEL.match(text or "")
     if not m:
         return None, text
     label = m.group(0)
-    if not label or len(label) >= len(text):
+    rest = (text or "")[len(label):]
+    if not label or not rest.strip():
         return None, text
-    return label, text[len(label):]
+    return label, rest
