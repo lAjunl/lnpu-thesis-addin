@@ -204,6 +204,76 @@ class PageJump(QWidget):
         self._syncing = False
 
 
+class _DropOverlay(QWidget):
+    """拖入文档时的半透明浮层：只盖住下方双栏预览区，不染蓝顶部卡片。"""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._filename = ""
+        self.hide()
+
+    def set_filename(self, name: str) -> None:
+        self._filename = name or ""
+        self.update()
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # 避开顶部 34px 的「原稿 / 排版后」标题条，只罩住真正的双栏页面预览画布
+        top_offset = 34.0 if self.height() > 120 else 0.0
+        r = QRectF(self.rect()).adjusted(0.0, top_offset, 0.0, 0.0)
+        # 半透明淡蓝遮罩
+        p.fillRect(r, QColor(0, 122, 255, 28))
+        # 预览区内侧虚线圆角框
+        box = r.adjusted(14, 14, -14, -14)
+        pen = QPen(QColor("#007aff"), 2.0, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(box, 12, 12)
+
+        # 中央提示卡片
+        msg = (f"松开鼠标，打开 {self._filename}"
+               if self._filename else "松开鼠标，打开文档")
+        f = self.font()
+        f.setPointSize(11)
+        f.setBold(True)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(msg)
+        th = fm.height()
+        icon_w = 22
+        gap = 10
+        pw = max(220.0, min(r.width() - 60.0, tw + icon_w + gap + 48.0))
+        ph = max(52.0, th + 28.0)
+        card = QRectF(r.left() + (r.width() - pw) / 2.0,
+                      r.top() + (r.height() - ph) / 2.0, pw, ph)
+        p.setPen(QPen(QColor("#99c8ff"), 1.2))
+        p.setBrush(QColor(255, 255, 255, 242))
+        p.drawRoundedRect(card, 12, 12)
+
+        # 文档图标（QPainter 绘）
+        ix = card.left() + 20.0
+        iy = card.center().y() - 10.0
+        doc_r = QRectF(ix, iy, 16.0, 20.0)
+        p.setPen(QPen(QColor("#007aff"), 1.6))
+        p.setBrush(QColor("#e8f1ff"))
+        p.drawRoundedRect(doc_r, 2.5, 2.5)
+        for li, ratio in enumerate((0.62, 0.45)):
+            ly = doc_r.top() + 7.0 + li * 4.5
+            p.drawLine(QPointF(doc_r.left() + 3.5, ly),
+                       QPointF(doc_r.left() + 3.5 + 9.0 * ratio, ly))
+
+        # 提示文字
+        tx = ix + icon_w + gap - 4.0
+        text_r = QRectF(tx, card.top(), card.right() - tx - 16.0, card.height())
+        p.setPen(QColor("#0060cc"))
+        elided = fm.elidedText(msg, Qt.TextElideMode.ElideMiddle, int(text_r.width()))
+        p.drawText(text_r, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
+        p.end()
+
+
 class _FnWorker(QThread):
     """在后台线程跑纯 python-docx 耗时任务，避免长文档卡死 Qt 主线程。"""
 
@@ -269,6 +339,7 @@ class MainWindow(QMainWindow):
 
         split = QSplitter(Qt.Horizontal)
         split.setHandleWidth(1)
+        self.preview_split = split
         self.before_view = PageView()
         self.after_view = PageView()
         self.after_view.set_paragraph_handler(self._para_menu)
@@ -286,7 +357,18 @@ class MainWindow(QMainWindow):
         split.addWidget(self.before_wrap)
         split.addWidget(self.after_wrap)
         split.setSizes([680, 680])
-        outer.addWidget(split, 1)
+
+        # 用普通 QWidget 容器包裹 QSplitter，再把拖拽浮层挂到容器上：
+        # QSplitter 会把所有直接子控件当成分栏塞进去，不能直接当浮层的 parent
+        self.preview_host = QWidget()
+        ph_lay = QVBoxLayout(self.preview_host)
+        ph_lay.setContentsMargins(0, 0, 0, 0)
+        ph_lay.setSpacing(0)
+        ph_lay.addWidget(split)
+        outer.addWidget(self.preview_host, 1)
+
+        self._drop_overlay = _DropOverlay(self.preview_host)
+        self.preview_host.installEventFilter(self)
 
         self._connect_sync()
         self.setCentralWidget(root)
@@ -303,6 +385,10 @@ class MainWindow(QMainWindow):
         # 段落浮动格式条一消失就清空多选，避免下一次误把上一批再改一遍
         if obj is getattr(self, "_para_dlg", None) and ev.type() == QEvent.Type.Hide:
             self._clear_para_selection()
+        elif obj is getattr(self, "preview_host", None) and ev.type() == QEvent.Type.Resize:
+            ov = getattr(self, "_drop_overlay", None)
+            if ov is not None:
+                ov.setGeometry(obj.rect())
         return super().eventFilter(obj, ev)
 
     # ---------------------------------------------------------------- #
@@ -1035,10 +1121,17 @@ class MainWindow(QMainWindow):
         return None
 
     def _drop_hl(self, on: bool, name: str = "") -> None:
-        """拖拽悬停时的视觉反馈：内容区淡蓝 + 状态栏提示。"""
-        cw = self.centralWidget()
-        if cw is not None:
-            cw.setStyleSheet("background:#e8f1ff;" if on else "")
+        """拖拽悬停时的视觉反馈：下方预览区半透明淡蓝浮层 + 状态栏提示。"""
+        ov = getattr(self, "_drop_overlay", None)
+        host = getattr(self, "preview_host", None)
+        if ov is not None and host is not None:
+            if on:
+                ov.set_filename(name)
+                ov.setGeometry(host.rect())
+                ov.raise_()
+                ov.show()
+            else:
+                ov.hide()
         if on:
             self.statusBar().showMessage(f"松开鼠标，打开 {name}")
 
@@ -1059,6 +1152,9 @@ class MainWindow(QMainWindow):
                 event.ignore()
             else:
                 event.acceptProposedAction()
+                ov = getattr(self, "_drop_overlay", None)
+                if ov is not None and not ov.isVisible():
+                    self._drop_hl(True, p.name)
             return True
         if t == QEvent.Type.DragLeave:
             self._drop_hl(False)

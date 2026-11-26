@@ -33,6 +33,9 @@ print("复制程序文件:", n)
 
 # 2) 文档与示例
 shutil.copy2(ROOT / "README.md", stage / "README.md")
+changelog = ROOT / "CHANGELOG.md"
+if changelog.is_file():
+    shutil.copy2(changelog, stage / "CHANGELOG.md")
 (stage / "docs").mkdir(exist_ok=True)
 shutil.copy2(ROOT / "docs" / "screenshot.png", stage / "docs" / "screenshot.png")
 sample = ROOT / "assets" / "sample-filled.docx"

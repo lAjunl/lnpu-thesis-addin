@@ -358,12 +358,67 @@ def _insert_runs(cur: QTextCursor, text: str, cjk: str, latin: str,
         cur.insertText(seg, _char_format(cjk if is_cjk else latin, size, bold, color))
 
 
+def _para_breaks(p_el) -> tuple[bool, bool, bool]:
+    """检查段落中的显式分页/分节符。
+
+    返回 (break_before, break_after, has_page_or_sect_break)：
+    - w:pPr/w:pageBreakBefore（val 非 0/false/off）→ 段前分页
+    - w:pPr/w:sectPr（type 非 continuous）→ 段后分节换页
+    - w:r/w:br[@w:type="page"] → 按在段落中相对可见内容的位置判定段前或段后分页
+    """
+    break_before = False
+    break_after = False
+    ppr = p_el.find(qn("w:pPr"))
+    if ppr is not None:
+        pbb = ppr.find(qn("w:pageBreakBefore"))
+        if pbb is not None and (pbb.get(qn("w:val")) or "").lower() not in (
+            "0", "false", "off"
+        ):
+            break_before = True
+        sp = ppr.find(qn("w:sectPr"))
+        if sp is not None:
+            tp = sp.find(qn("w:type"))
+            sv = (tp.get(qn("w:val")) or "").lower() if tp is not None else ""
+            if sv != "continuous":
+                break_after = True
+
+    w_br = qn("w:br")
+    w_type = qn("w:type")
+    if p_el.find(".//" + w_br) is not None:
+        w_t = _W_T
+        content_tags = (_W_DRAWING, _W_PICT, _W_OBJ, qn("m:oMath"), qn("m:oMathPara"))
+        seen_content = False
+        seen_br_before_content = False
+        has_any_br = False
+        for el in p_el.iter():
+            tag = el.tag
+            if tag == w_br and (el.get(w_type) or "").lower() == "page":
+                has_any_br = True
+                if seen_content:
+                    break_after = True
+                else:
+                    seen_br_before_content = True
+            elif tag == w_t and (el.text or "").strip():
+                seen_content = True
+            elif tag in content_tags:
+                seen_content = True
+        if has_any_br:
+            if seen_br_before_content and seen_content:
+                break_before = True
+            elif not seen_content:
+                break_after = True
+
+    return break_before, break_after, (break_before or break_after)
+
+
 def _insert_paragraph(cur: QTextCursor, text: str, cjk: str, latin: str,
                       size: float, bold: bool, line_pt: float,
                       align: str | None, indent_pt: float = 0.0,
                       color: str = "", marks: bool = False,
                       label_bold: bool = False,
-                      left_margin: float = 0.0) -> None:
+                      left_margin: float = 0.0,
+                      page_break_before: bool = False,
+                      reuse_first: bool = False) -> None:
     bf = QTextBlockFormat()
     bf.setAlignment(_align_flag(align))
     # 直接给磅值：FixedHeight 的单位就是布局单位（1 单位 = 1 磅）
@@ -372,7 +427,15 @@ def _insert_paragraph(cur: QTextCursor, text: str, cjk: str, latin: str,
     bf.setRightMargin(0)
     if indent_pt:
         bf.setTextIndent(indent_pt)
-    cur.insertBlock(bf)
+    if page_break_before:
+        bf.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore)
+    if reuse_first:
+        cur.setBlockFormat(bf)
+    else:
+        cur.insertBlock(bf)
+    if not text:
+        cur.setBlockCharFormat(_char_format(cjk, size, bold, color))
+        return
     # 段落开头的 "Abstract:" / "关键词:" 只加粗标签那几个字
     if label_bold:
         from ..labels import split_label
@@ -681,7 +744,9 @@ def _ensure_rule_resource(td: QTextDocument) -> None:
 
 
 def _rule_block(cur: QTextCursor, content_w: float, width_pt: float,
-                w: float | None = None, off: float = 0.0) -> None:
+                w: float | None = None, off: float = 0.0,
+                page_break_before: bool = False,
+                reuse_empty: bool = True) -> None:
     """画一条横线：用浮点高度的 QTextImageFormat 拉伸纯色资源。
 
     相比整像素 QImage（1px 在缩放 60%~75% 时容易被抽丢、0.75pt 与 1.5pt 拉不开差距），
@@ -699,10 +764,12 @@ def _rule_block(cur: QTextCursor, content_w: float, width_pt: float,
     bf.setLeftMargin(off)
     bf.setRightMargin(max(0.0, content_w - off - w))
     bf.setLineHeight(max(2.0, h_pt + 0.8), _FIXED)
+    if page_break_before:
+        bf.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore)
     # 表格/frame 后面通常已经留了一个空块，直接复用——否则线会和
     # 表格之间空出一行（实测约 16 磅）
     blk = cur.block()
-    if blk.isValid() and not blk.text().strip():
+    if reuse_empty and blk.isValid() and not blk.text().strip():
         cur.setBlockFormat(bf)
         cur.insertImage(fmt)
     else:
@@ -730,7 +797,8 @@ def _frame_table(cur: QTextCursor, rows: list, cols: int, content_w: float,
                  color: str, align: str, w: float, off: float,
                  border_pt: float = 0.0,
                  cell_imgs: list | None = None,
-                 first_row_bold: bool | None = None) -> None:
+                 first_row_bold: bool | None = None,
+                 page_break_before: bool = False) -> None:
     """把一个表格包进无边框 frame 里，用 frame 的左右边距控制表格位置。"""
     col_w = w / max(1, cols)
     tf = QTextTableFormat()
@@ -752,6 +820,8 @@ def _frame_table(cur: QTextCursor, rows: list, cols: int, content_w: float,
     ff.setPadding(0)
     ff.setLeftMargin(off)
     ff.setRightMargin(max(0.0, content_w - off - w))
+    if page_break_before:
+        ff.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore)
     fr = cur.insertFrame(ff)
     cur.setPosition(fr.firstPosition())
     t = cur.insertTable(len(rows), cols, tf)
@@ -786,12 +856,14 @@ def _one_row_table(cur: QTextCursor, texts: list, content_w: float,
                    latin: str = FALLBACK_LATIN, size: float = 10.5,
                    bold: bool = False, color: str = "",
                    align: str = "left", w: float | None = None,
-                   off: float = 0.0, cell_imgs: list | None = None) -> None:
+                   off: float = 0.0, cell_imgs: list | None = None,
+                   page_break_before: bool = False) -> None:
     w = float(w) if w else content_w
     _frame_table(cur, [list(texts)], len(texts), content_w, line_pt,
                  cjk, latin, size, bold, color, align, w, off,
                  border_pt=0.0,
-                 cell_imgs=[cell_imgs] if cell_imgs is not None else None)
+                 cell_imgs=[cell_imgs] if cell_imgs is not None else None,
+                 page_break_before=page_break_before)
 
 
 def _orig_table_style(table) -> tuple[str, float, float]:
@@ -851,7 +923,9 @@ def _insert_table(doc, cur: QTextCursor, t_i: int, content_w: float,
                   style: str = "three_line",
                   line_inner: float = 0.75,
                   header_bold: bool | None = None,
-                  table=None) -> None:
+                  table=None,
+                  page_break_before: bool = False,
+                  reuse_first: bool = False) -> None:
     """预览表格：支持三线表（两粗一细）、网格表、无线表，并渲染单元格里的图片。
 
     三线表为什么拆分绘制：PySide6 的 QTextTableCellFormat 分边边框不绘制，
@@ -896,7 +970,8 @@ def _insert_table(doc, cur: QTextCursor, t_i: int, content_w: float,
         _frame_table(cur, all_texts, cols, content_w, line_pt, cjk, latin,
                      size, bold, color, align, w, off,
                      border_pt=bw, cell_imgs=all_imgs,
-                     first_row_bold=h_bold)
+                     first_row_bold=h_bold,
+                     page_break_before=page_break_before)
         cur.insertBlock()
         return
 
@@ -904,7 +979,8 @@ def _insert_table(doc, cur: QTextCursor, t_i: int, content_w: float,
         _frame_table(cur, all_texts, cols, content_w, 0.0, cjk, latin,
                      size, bold, color, align, w, off,
                      border_pt=0.0, cell_imgs=all_imgs,
-                     first_row_bold=h_bold)
+                     first_row_bold=h_bold,
+                     page_break_before=page_break_before)
         cur.insertBlock()
         return
 
@@ -912,10 +988,14 @@ def _insert_table(doc, cur: QTextCursor, t_i: int, content_w: float,
     outer = float(line_pt or 0)
     inner = float(line_inner or 0) if float(line_inner or 0) > 0 else outer
     if outer > 0:
-        _rule_block(cur, content_w, outer, w, off)        # 顶线（粗）
+        # 顶线不复用表前的空段落，避免吞掉正文/封面里的刻意空行
+        _rule_block(cur, content_w, outer, w, off,
+                    page_break_before=page_break_before,
+                    reuse_empty=reuse_first)              # 顶线（粗）
     _one_row_table(cur, all_texts[0], content_w, outer,
                    cjk, latin, size, h_bold, color, align, w, off,
-                   cell_imgs=all_imgs[0])
+                   cell_imgs=all_imgs[0],
+                   page_break_before=(page_break_before and outer <= 0))
     if inner > 0:
         _rule_block(cur, content_w, inner, w, off)        # 栏目线（细）
     if len(all_texts) > 1:
@@ -984,11 +1064,28 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
     block_of: dict[int, QTextBlock] = {}
     shown = 0
     shown_tbl = 0
+    started = False
+    pending_break = False
 
-    for kind, i in blocks_src:
+    # 裁掉文末连续的无意义空段，避免在文档末尾平白多出空白页；
+    # 文档开头与中间的空行（如封面留白、段落间隔）全部如实保留。
+    last_content = -1
+    for idx_b in range(len(blocks_src) - 1, -1, -1):
+        k_b, i_b = blocks_src[idx_b]
+        if k_b == "tbl":
+            last_content = idx_b
+            break
+        fb = feats[i_b]
+        if fb.text.strip() or fb.has_image or fb.has_math or fb.has_ole:
+            last_content = idx_b
+            break
+    blocks_trim = blocks_src[:last_content + 1] if last_content >= 0 else []
+
+    for kind, i in blocks_trim:
         if kind == "tbl":
             if shown_tbl < MAX_TABLES and i < len(tables):
                 tbl = tables[i]
+                pb_tbl = pending_break and started
                 if side == "before":
                     st, ow, iw = _orig_table_style(tbl)
                     orig = inspect_tbl(doc, [tbl], style_index=style_idx)
@@ -1004,6 +1101,8 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
                         style=st, line_inner=iw,
                         header_bold=bool(orig.get("header_bold")),
                         table=tbl,
+                        page_break_before=pb_tbl,
+                        reuse_first=not started,
                     )
                 else:
                     _insert_table(
@@ -1014,14 +1113,69 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
                         style=tbl_style, line_inner=table_inner,
                         header_bold=tbl_header_bold,
                         table=tbl,
+                        page_break_before=pb_tbl,
+                        reuse_first=not started,
                     )
                 shown_tbl += 1
+                started = True
+                pending_break = False
             continue
 
         f = feats[i]
-        if (not f.text.strip() and not f.has_image
-                and not f.has_math and not f.has_ole):
+        para_obj = paras[i]
+        br_before, br_after, has_br = _para_breaks(para_obj._p)
+        is_blank = (not f.text.strip() and not f.has_image
+                    and not f.has_math and not f.has_ole)
+
+        if is_blank:
+            if has_br:
+                # 仅含分页符/分节符的空段：切到下一页，不在新页顶部多出一行空白
+                if started:
+                    if pending_break:
+                        # 连续两个纯分页段：保留一张有意的空白页
+                        sz_b = f.size_pt or 12.0
+                        nat_b = _natural_pt(f.ascii_font or FALLBACK_LATIN, sz_b)
+                        lp_b = _line_pt_before(f.line_rule, f.line_value, nat_b)
+                        _insert_paragraph(
+                            cur, "", f.east_asia or FALLBACK_CJK,
+                            f.ascii_font or FALLBACK_LATIN, sz_b, False, lp_b,
+                            f.align, 0.0, "", False, False, 0.0,
+                            page_break_before=True, reuse_first=False,
+                        )
+                    pending_break = True
+                continue
+            if shown >= MAX_PARAS:
+                continue
+            # 纯空行：原稿侧与排版后侧未改格式（other）均沿用原稿行高，
+            # 既保留封面/段间留白，又不把紧凑空行误撑成正文行距
+            cjk = f.east_asia or FALLBACK_CJK
+            latin = f.ascii_font or FALLBACK_LATIN
+            size = f.size_pt or 12.0
+            natural = _natural_pt(latin, size)
+            line_pt = _line_pt_before(f.line_rule, f.line_value, natural)
+            if side == "after":
+                d = analysis.detections[i]
+                role = effective_role(d)
+                ov = (overrides or {}).get(i)
+                base = settings.roles.get(role)
+                if ov or base:
+                    p = dict(base or settings.roles.get("body") or {})
+                    if ov:
+                        p.update({k: v for k, v in ov.items() if v is not None})
+                    size = float(p.get("size", size))
+                    natural = _natural_pt(p.get("ascii") or latin, size)
+                    line_pt = _line_pt(p.get("line_rule") or "exact",
+                                       float(p.get("line", 22)), natural)
+            _insert_paragraph(
+                cur, "", cjk, latin, size, False, line_pt, f.align,
+                0.0, "", False, False, 0.0,
+                page_break_before=(pending_break and started),
+                reuse_first=not started,
+            )
+            started = True
+            pending_break = False
             continue
+
         if not f.has_image and shown >= MAX_PARAS:
             continue
 
@@ -1086,7 +1240,6 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
                     text = tab_plans[i] + clean_caption(text, aggressive=True)
 
         # ---- 公式：OMML 自绘 / MathType 走 EMF，按文档顺序全部渲染成图 ----
-        para_obj = paras[i]
         formula_ims = (_formula_images(para_obj, content_w, size,
                                        latin, bold)
                        if (f.has_math or f.has_ole) else [])
@@ -1096,6 +1249,7 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
             from ..features import _math_text
             text = _math_text(para_obj) or "（公式）"
 
+        pb_before = (pending_break or br_before) and started
         if formula_ims and not standalone:
             # 行内公式：文字和公式图按原文顺序铺在同一段里。
             # 图比行距高时把这一段的固定行距抬到图高，否则公式会压到上一行
@@ -1103,14 +1257,20 @@ def render_side(doc, analysis, settings, side: str, content: tuple[float, float]
                        for im in formula_ims)
             line_pt = max(line_pt, im_h + 2.0)
             _insert_paragraph(cur, "", cjk, latin, size, bold, line_pt, align,
-                              indent_pt, color, False, False, left_margin)
+                              indent_pt, color, False, False, left_margin,
+                              page_break_before=pb_before,
+                              reuse_first=not started)
             block_of[i] = cur.block()
             _insert_inline_formula(cur, para_obj, formula_ims,
                                    cjk, latin, size, bold, color)
         else:
             _insert_paragraph(cur, text, cjk, latin, size, bold, line_pt, align,
-                              indent_pt, color, marks_on, label_bold, left_margin)
+                              indent_pt, color, marks_on, label_bold, left_margin,
+                              page_break_before=pb_before,
+                              reuse_first=not started)
             block_of[i] = cur.block()
+        started = True
+        pending_break = br_after
 
         if f.has_image:
             img_align = align if align in ("left", "center", "right") else "center"

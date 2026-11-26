@@ -1225,6 +1225,60 @@ def main() -> int:
           adlg.repo_label.text())
     adlg.close()
 
+    # ---- 拖放浮层：只盖住下方预览区，不染蓝顶部卡片 ----
+    win._drop_hl(True, "demo.docx")
+    app.processEvents()
+    check("拖放悬停：浮层覆盖整个下方预览区（且不挤占分栏）",
+          win._drop_overlay.isVisible()
+          and win.preview_split.count() == 2
+          and win._drop_overlay.geometry() == win.preview_host.rect()
+          and win._drop_overlay.width() == win.width(),
+          f"vis={win._drop_overlay.isVisible()} cols={win.preview_split.count()} geo={win._drop_overlay.geometry()}")
+    check("拖放悬停：不改 centralWidget 样式（顶部卡片不变蓝）",
+          win.centralWidget().styleSheet() == "",
+          repr(win.centralWidget().styleSheet()))
+    win._drop_hl(False)
+    app.processEvents()
+    check("拖放离开：隐藏预览区浮层", not win._drop_overlay.isVisible(), "")
+
+    # ---- 预览空白行与分页符/分节符渲染（含文末空段裁剪与 val=0 防误判） ----
+    blk_doc = Document()
+    blk_doc.add_paragraph("第一行")
+    for _ in range(4):
+        blk_doc.add_paragraph("")
+    p_after_blank = blk_doc.add_paragraph("空行之后的第二行")
+    # 模拟 Word 常见的 w:pageBreakBefore w:val="0"（不得误分页）
+    _pbb0 = _OE("w:pageBreakBefore")
+    _pbb0.set(_qn("w:val"), "0")
+    p_after_blank._p.get_or_add_pPr().append(_pbb0)
+    # 显式手动分页符
+    p_br = blk_doc.add_paragraph("")
+    _r_br = p_br.add_run()
+    _br_el = _OE("w:br")
+    _br_el.set(_qn("w:type"), "page")
+    _r_br._r.append(_br_el)
+    blk_doc.add_paragraph("分页后的第二页正文")
+    # 文末 10 个连续空段：应被裁掉，不产生空白尾页
+    for _ in range(10):
+        blk_doc.add_paragraph("")
+
+    blk_ana = analyze(blk_doc)
+    blk_set = Settings()
+    _, _, blk_content = page_geometry(blk_set)
+    for sd in ("before", "after"):
+        td_b, bmap_b = render_side(blk_doc, blk_ana, blk_set, sd, blk_content)
+        lay_b = td_b.documentLayout()
+        y0 = lay_b.blockBoundingRect(bmap_b[0]).y()
+        y5 = lay_b.blockBoundingRect(bmap_b[5]).y()
+        y7 = lay_b.blockBoundingRect(bmap_b[7]).y()
+        pc_b = page_count(td_b)
+        check(f"预览空白行渲染({sd})：中间4个空行拉开段间距",
+              (y5 - y0) > 60.0,
+              f"y0={y0:.1f} y5={y5:.1f} delta={y5 - y0:.1f}")
+        check(f"预览分页符与文末空段裁剪({sd})：val=0不误分页、br分页生效且总页数=2",
+              y5 < blk_content[1] and y7 >= blk_content[1] - 0.5 and pc_b == 2,
+              f"y5={y5:.1f} y7={y7:.1f} pages={pc_b} ch={blk_content[1]:.1f}")
+
     print("\n" + ("全部通过" if not FAIL else f"失败 {len(FAIL)} 项: {FAIL}"))
     win.close()
     return 1 if FAIL else 0
